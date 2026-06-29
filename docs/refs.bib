@@ -1,0 +1,81 @@
+% refs.bib — GPS Track Conditioning: clothoid and Kalman module references
+
+@article{bertolazzi2018,
+  title   = {Interpolating clothoid splines with curvature continuity},
+  author  = {Bertolazzi, Enrico and Frego, Marco},
+  journal = {Mathematical Methods in the Applied Sciences},
+  volume  = {41},
+  number  = {4},
+  pages   = {1723--1737},
+  year    = {2018},
+  doi     = {10.1002/mma.4700},
+  url     = {https://doi.org/10.1002/mma.4700},
+}
+
+@article{bertolazzi2015,
+  title   = {{G1} fitting with clothoids},
+  author  = {Bertolazzi, Enrico and Frego, Marco},
+  journal = {Mathematical Methods in the Applied Sciences},
+  volume  = {38},
+  number  = {5},
+  pages   = {881--897},
+  year    = {2015},
+  doi     = {10.1002/mma.3114},
+  url     = {https://doi.org/10.1002/mma.3114},
+}
+
+@software{pyclothoids,
+  title   = {pyclothoids: {P}ython bindings for the {B}ertolazzi-{F}rego clothoid library},
+  author  = {Bertolazzi, Enrico},
+  url     = {https://github.com/ebertolazzi/Clothoids},
+  year    = {2023},
+  note    = {Python package wrapping the C++ Clothoids library},
+}
+
+@book{wild2010,
+  title     = {Strassenplanung},
+  author    = {Wild, Helmut},
+  publisher = {Werner Verlag},
+  edition   = {7},
+  year      = {2010},
+  note      = {German road design standard; defines clothoid transition curves between straights and circular arcs},
+}
+
+@article{kalman1960,
+  title   = {A new approach to linear filtering and prediction problems},
+  author  = {Kalman, Rudolf Emil},
+  journal = {Journal of Basic Engineering},
+  volume  = {82},
+  number  = {1},
+  pages   = {35--45},
+  year    = {1960},
+  doi     = {10.1115/1.3662552},
+}
+
+@article{rauch1965,
+  title   = {Maximum likelihood estimates of linear dynamic systems},
+  author  = {Rauch, Herbert E. and Tung, F. and Striebel, Charlotte T.},
+  journal = {AIAA Journal},
+  volume  = {3},
+  number  = {8},
+  pages   = {1445--1450},
+  year    = {1965},
+  doi     = {10.2514/3.3166},
+  url     = {https://doi.org/10.2514/3.3166},
+  note    = {Introduces the Rauch--Tung--Striebel (RTS) backward smoother for
+             minimum-variance offline state estimation},
+}
+
+@inproceedings{numba2015,
+  title     = {{Numba}: A {LLVM}-based {Python} {JIT} compiler},
+  author    = {Lam, Siu Kwan and Pitrou, Antoine and Seibert, Stanley},
+  booktitle = {Proceedings of the Second Workshop on the LLVM Compiler
+               Infrastructure in HPC (LLVM-HPC)},
+  pages     = {1--6},
+  year      = {2015},
+  publisher = {ACM},
+  doi       = {10.1145/2833157.2833162},
+  url       = {https://doi.org/10.1145/2833157.2833162},
+  note      = {JIT compiler for numerical Python; achieves 14× speedup over
+               pure-Python EKF implementation in this project},
+}
