@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numba import njit
 
-from .processor import EARTH_METERS_PER_DEGREE
+from .constants import EARTH_METERS_PER_DEGREE
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray

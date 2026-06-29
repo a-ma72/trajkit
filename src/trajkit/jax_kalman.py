@@ -42,8 +42,8 @@ except ImportError as _jax_err:
     )
     raise ImportError(msg) from _jax_err
 
+from .constants import EARTH_METERS_PER_DEGREE
 from .kalman import KalmanConfig, KalmanResult
-from .processor import EARTH_METERS_PER_DEGREE
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray

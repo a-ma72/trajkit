@@ -40,50 +40,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+# Defined centrally in constants.py so that clothoid.py can import
+# EARTH_METERS_PER_DEGREE without importing processor.py — importing it here
+# at module level would close an import cycle (processor -> clothoid ->
+# processor) during package initialisation.  Re-exported below for backward
+# compatibility with code that does `from trajkit.processor import
+# EARTH_METERS_PER_DEGREE`.
 
-EARTH_METERS_PER_DEGREE: float = 111_139.0
-"""Approximate meters per degree of latitude."""
-
-_SAVGOL_MIN_WINDOW: int = 51
-"""Minimum Savgol filter window [samples].
-
-Ensures stable polynomial fitting even when the arc-length grid is coarse
-(high speed, sparse GPS) so that the window computed from a distance budget
-would otherwise fall below the polyorder+2 threshold.  Must be odd; 51
-gives ~50-sample support for the degree-3 polynomial used throughout.
-"""
-
-_SAVGOL_POLYORDER: int = 3
-"""Polynomial order for all Savitzky-Golay filter calls.
-
-Degree 3 balances smoothness (removes GPS-scale noise) with fidelity
-to the signal shape (preserves curvature peaks in the heading signal).
-"""
-
-_MS_TO_KMH: float = 3.6
-"""Conversion factor from m/s to km/h (1 m/s = 3.6 km/h)."""
-
-_S_TO_MS: float = 1000.0
-"""Conversion factor from seconds to milliseconds."""
-
-_PCT_FACTOR: float = 100.0
-"""Multiplication factor to convert a fraction [0, 1] to percent [0, 100]."""
-
-_DS_EPS_M: float = 1e-6
-"""Minimum arc-length step [m] used as a guard against division by zero
-when computing curvature as dθ/ds.  Below this threshold, consecutive
-GPS samples are considered co-located."""
-
-_ABS_FLAG_THRESHOLD: float = 0.5
-"""Decision threshold for the binary ABS-active flag (stored as 0.0/1.0).
-Values above this are treated as ABS active."""
-
-_FREEZE_MIN_EPOCHS: int = 3
-"""Minimum number of GPS update epochs required by _repair_gps_freezes.
-
-Three epochs are needed to anchor the repair: one epoch before the freeze,
-at least one frozen epoch, and one epoch after for interpolation.
-"""
+from .constants import (  # noqa: E402
+    _ABS_FLAG_THRESHOLD,
+    _DS_EPS_M,
+    _FREEZE_MIN_EPOCHS,
+    _MS_TO_KMH,
+    _PCT_FACTOR,
+    _S_TO_MS,
+    _SAVGOL_MIN_WINDOW,
+    _SAVGOL_POLYORDER,
+    EARTH_METERS_PER_DEGREE,
+)
 
 
 # ---------------------------------------------------------------------------

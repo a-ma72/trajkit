@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "trajkit"
@@ -26,3 +26,5 @@ where = ["src"]
 [tool.setuptools.package-data]
 # PEP 561 — tells type checkers (mypy, pyright) this package ships type info
 trajkit = ["py.typed"]
+"trajkit.docs" = ["**/*"]
+"trajkit.notebooks" = ["**/*"]
