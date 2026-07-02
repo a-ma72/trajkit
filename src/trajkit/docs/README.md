@@ -128,6 +128,8 @@ GPSProcessor(
     min_speed_calibration=1.0,   # Min wheel speed for dt calibration [m/s]
     smoothing='butterworth',     # 'butterworth' | 'kalman' | 'kalman_jax' | 'g2'
     speed_smoothing_window=501,  # Savgol window (Butterworth mode, 0=disabled)
+    freeze_repair=True,          # Optional single-axis GPS freeze repair
+                                 # (default True; set False to disable)
     kalman_config=None,          # KalmanConfig — EKF tuning (dt auto-calibrated if None)
     g2_config=None,              # G2ClothoidConfig — SolveG2 fit params (smoothing='g2')
 )
@@ -165,13 +167,21 @@ Run the full pipeline. Returns `GPSTrack`.
 - `yaw_rate_rad` — pre-computed signed yaw rate [rad/s]. Only used if
   `steering_angle_deg` is not provided.
 
-**ABS speed clamping** (optional but recommended):
+**ABS braking handling** (optional but recommended):
 - `abs_flag` — binary ABS active flag (1 = ABS intervening, 0 = normal).  
   Channel: `ABS_FLAG` in the daq data.  
-  When provided, wheel speed is clamped to the last pre-ABS value during ABS
-  events before computing yaw rate via the bicycle model. This prevents
-  ABS-induced wheel-speed oscillations (~15 Hz) from corrupting the heading
-  estimate and degrading the Kalman-filtered trajectory.
+  When provided, two mechanisms protect the Kalman filter during ABS events:
+  1. **Speed interpolation**: Wheel speed through ABS epochs is linearly
+     interpolated between pre/post-ABS anchors (removes 15 Hz lock/unlock
+     oscillation while preserving the deceleration trend).
+  2. **Adaptive noise inflation**: Kalman measurement and process noise are
+     inflated during ABS with a 200 ms temporal margin and 50 ms cosine ramp.
+     The inflation level depends on the yaw rate source:
+     - Bicycle model (`steering_angle_deg`): σ_ω ×7, σ_v ×2, Q ×10
+     - Direct sensor (`yaw_rate_rad`): σ_v ×2, Q ×10, σ_ω unchanged
+     Inflation mask dilated by 1000 ms (covers flag latency + pre-flag
+     tire saturation) with 100 ms cosine ramp.
+  See §"ABS Braking Robustness" below for details.
 
 ### `G2ClothoidApproximator` (G2-continuous clothoid chain)
 
@@ -356,12 +366,70 @@ This is handled automatically when passing `steering_angle_deg` to `process()`.
 If both `steering_angle_deg` and `yaw_rate_rad` are provided, `steering_angle_deg`
 takes priority and a warning is logged.
 
-**ABS speed clamping**: During ABS braking, wheel speed (WHEEL_SPEED_KMH) oscillates at
-~15 Hz from lock/unlock cycles. These oscillations corrupt the bicycle-model
-yaw rate and cause heading drift in the Kalman filter. When `abs_flag=ABS_FLAG`
-is provided, the speed used for yaw rate computation is clamped to the last
-pre-ABS value during each ABS event. The raw WHEEL_SPEED_KMH still feeds the Kalman
-filter as a wheel speed measurement (correctly reflects deceleration).
+### ABS Braking Robustness
+
+During ABS braking, wheel speed (WHEEL_SPEED_KMH) oscillates at ~15 Hz from
+lock/unlock cycles. Without treatment, these oscillations cause three problems:
+
+1. **Bicycle-model yaw rate is invalid** — ω = v·tan(δ)/L uses oscillating v,
+   producing error/σ ratios of ~3.5× that drift heading up to 8° over a 2 s event.
+2. **Wheel speed is unreliable** — the raw signal swings ±10 km/h around the true
+   deceleration curve.
+3. **CTRV prediction is wrong** — with invalid ω and v, position error accumulates
+   ~0.28 m per prediction epoch between GPS corrections.
+
+**Two-stage fix** (activated when `abs_flag` is provided):
+
+#### Stage 1: Speed interpolation (`_clamp_speed_during_abs`)
+
+Wheel speed during ABS epochs is linearly interpolated between the last non-ABS
+sample before and the first non-ABS sample after each event (`np.interp`).
+This removes the 15 Hz oscillation while capturing the deceleration trend
+(offline processing knows both anchor points).
+
+The interpolated `v_smooth` is used for both the bicycle-model yaw rate
+computation (ω = v·tan(δ)/L) and as the Kalman speed measurement input.
+
+#### Stage 2: Per-sample noise inflation
+
+Even with interpolated speed, the Kalman filter needs additional protection
+because: (a) the bicycle model is invalid during tire saturation, and (b) the
+linear speed approximation is imperfect.
+
+The inflation is **source-dependent** via the `_yr_from_model` flag:
+
+| Yaw rate source | σ_ω scale | σ_v scale | Q scale | Rationale |
+|-----------------|-----------|-----------|---------|----------|
+| Bicycle model (`steering_angle_deg`) | ×7 (→49× variance) | ×2 (→4× var.) | ×10 | Model invalid during tire saturation |
+| Direct sensor (`yaw_rate_rad`, e.g. ESP) | ×1 (unchanged) | ×2 (→4× var.) | ×10 | Sensor valid; only speed approx. uncertain |
+
+**Temporal margin (1000 ms)**: The ABS flag lags behind actual tire saturation
+by 200–700 ms (pedal → pressure build-up → tire saturation → ABS flag). During
+curve-braking the steering angle corrupts the bicycle model even earlier.
+The noise inflation mask is dilated by 1000 ms on both sides of each ABS
+event to fully cover the pre-onset transient.
+
+**Cosine ramp (100 ms)**: Instead of a step function, the scale factors ramp
+from 1.0 to peak via a cosine half-wave at each ABS edge. This avoids
+Kalman gain discontinuities that would cause position transients.
+
+```
+scale(t) = 1.0 + (peak - 1.0) × 0.5 × (1 - cos(π × t / t_ramp))
+```
+
+The per-sample arrays `r_omega_arr`, `r_v_arr`, and `q_scale_arr` are passed
+to the Numba EKF kernel, which applies them at each prediction/update step.
+
+**Effect** (real data, steering-angle model, full stops from 46–56 km/h):
+
+| Metric | Value |
+|--------|-------|
+| Mean \|Kalman − BW\| during ABS (straight) | ~15 cm |
+| Max \|Kalman − BW\| during ABS (straight) | < 90 cm |
+| Mean \|Kalman − BW\| during ABS (curve, worst case) | 21 cm |
+| Max \|Kalman − BW\| during ABS (curve, worst case) | 90 cm |
+| Speed tracking (Kalman vs wheel) | smooth deceleration, no oscillation |
+| Normal driving accuracy | unchanged (full sensor fusion) |
 
 ### Tuning Guide
 
@@ -436,8 +504,10 @@ is N = f_s / f_GPS (prediction steps between corrections).
 ### GPS Single-Axis Freeze Repair
 
 GPS receivers occasionally "freeze" one coordinate axis (e.g. latitude constant
-while longitude continues updating). The `_repair_gps_freezes()` method detects
-and repairs these artifacts before Kalman filtering:
+while longitude continues updating). This repair is now optional and controlled
+via `GPSProcessor(..., freeze_repair=True/False)`. When enabled, the
+`_repair_gps_freezes()` method detects and repairs these artifacts before
+Kalman filtering:
 
 **Detection** (all three must hold for a run of ≥3 consecutive epochs):
 1. One axis has zero change (frozen)

@@ -169,6 +169,9 @@ def _ekf_forward_rts(
     v_ref: np.ndarray,
     yaw_rate: np.ndarray,
     gps_mask: np.ndarray,
+    r_omega_arr: np.ndarray,
+    r_v_arr: np.ndarray,
+    q_scale_arr: np.ndarray,
     dt: float,
     sigma_pos_gps: float,
     sigma_v_wheel: float,
@@ -210,9 +213,8 @@ def _ekf_forward_rts(
     Q[4, 3] = dt * sya2
     Q[4, 4] = sya2
 
-    # Measurement noise (GPS R is speed-dependent, computed per update)
-    r_v = sigma_v_wheel ** 2
-    r_omega = sigma_yaw_rate ** 2
+    # Measurement noise: r_v and r_omega are per-sample arrays
+    # (inflated during ABS to reduce trust in interpolated values)
 
     # Storage
     states_fwd = np.zeros((n, dim))
@@ -263,7 +265,7 @@ def _ekf_forward_rts(
         theta_new = theta + omega * dt
 
         state_pred = np.array([x_new, y_new, v, theta_new, omega])
-        P_p = F @ P @ F.T + Q
+        P_p = F @ P @ F.T + Q * q_scale_arr[k]
 
         states_pred[k] = state_pred
         P_pred[k] = P_p
@@ -272,16 +274,16 @@ def _ekf_forward_rts(
         state = state_pred
         P = P_p
 
-        # --- Update: wheel speed ---
+        # --- Update: wheel speed (per-sample noise, inflated during ABS) ---
         innov_v = v_ref[k] - state[2]
-        S_v = P[2, 2] + r_v
+        S_v = P[2, 2] + r_v_arr[k]
         K_v = P[:, 2].copy() / S_v  # .copy() for contiguous column
         state = state + K_v * innov_v
         P = P - np.outer(K_v, P[2, :].copy())
 
-        # --- Update: yaw rate ---
+        # --- Update: yaw rate (per-sample noise, inflated during ABS) ---
         innov_w = yaw_rate[k] - state[4]
-        S_w = P[4, 4] + r_omega
+        S_w = P[4, 4] + r_omega_arr[k]
         K_w = P[:, 4].copy() / S_w
         state = state + K_w * innov_w
         P = P - np.outer(K_w, P[4, :].copy())
@@ -406,6 +408,9 @@ class GPSKalmanFilter:
         yaw_rate_rad: NDArray[np.float64],
         gps_update_mask: NDArray[np.bool_],
         heading_init: float | None = None,
+        yaw_rate_noise_scale: NDArray[np.float64] | None = None,
+        speed_noise_scale: NDArray[np.float64] | None = None,
+        process_noise_scale: NDArray[np.float64] | None = None,
     ) -> KalmanResult:
         """Run the full EKF forward pass + optional RTS smoother.
 
@@ -464,6 +469,27 @@ class GPSKalmanFilter:
             cfg.sigma_yaw_rate**2,
         ]))
 
+        # Per-sample yaw rate measurement noise (inflated during ABS)
+        r_omega_base = cfg.sigma_yaw_rate ** 2
+        if yaw_rate_noise_scale is not None:
+            r_omega_arr = r_omega_base * yaw_rate_noise_scale
+        else:
+            r_omega_arr = np.full(len(longitude), r_omega_base)
+
+        # Per-sample wheel speed measurement noise (inflated during ABS)
+        r_v_base = cfg.sigma_v_wheel ** 2
+        if speed_noise_scale is not None:
+            r_v_arr = r_v_base * speed_noise_scale
+        else:
+            r_v_arr = np.full(len(longitude), r_v_base)
+
+        # Per-sample process noise scale (inflated during ABS so
+        # prediction covariance grows fast → GPS dominates)
+        if process_noise_scale is not None:
+            q_scale_arr = process_noise_scale
+        else:
+            q_scale_arr = np.ones(len(longitude))
+
         # Run Numba-accelerated EKF + RTS
         states_out, P_diag = _ekf_forward_rts(
             gps_x=np.ascontiguousarray(gps_x),
@@ -471,6 +497,9 @@ class GPSKalmanFilter:
             v_ref=np.ascontiguousarray(v_reference_ms),
             yaw_rate=np.ascontiguousarray(yaw_rate_rad),
             gps_mask=np.ascontiguousarray(gps_update_mask),
+            r_omega_arr=np.ascontiguousarray(r_omega_arr),
+            r_v_arr=np.ascontiguousarray(r_v_arr),
+            q_scale_arr=np.ascontiguousarray(q_scale_arr),
             dt=cfg.dt,
             sigma_pos_gps=cfg.sigma_pos_gps,
             sigma_v_wheel=cfg.sigma_v_wheel,

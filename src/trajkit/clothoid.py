@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 from .constants import (
+    EARTH_METERS_PER_DEGREE,
     _LARGE_ERROR_SENTINEL,
     _SEG_BUILD_MIN_PTS,
     _SEG_EVAL_MIN_PTS,
@@ -57,6 +58,69 @@ try:
 except (ImportError, AttributeError):
     _PYC_CC = None
     _PYCLOTHOIDS = False
+
+# ---------------------------------------------------------------------------
+# Coordinate conversion
+# ---------------------------------------------------------------------------
+
+
+def gps_enu(
+    a: "NDArray[np.float64]",
+    b: "NDArray[np.float64]",
+    *,
+    origin: tuple[float, float] | None = None,
+    inverse: bool = False,
+) -> tuple["NDArray[np.float64]", "NDArray[np.float64]", tuple[float, float]]:
+    """Convert between WGS84 geographic and local ENU coordinates.
+
+    A single function for both directions of the flat-Earth tangent-plane
+    approximation used throughout trajkit.
+
+    Parameters
+    ----------
+    a, b :
+        Forward (``inverse=False``): longitude [°], latitude [°].
+        Inverse (``inverse=True``): x_east [m], y_north [m].
+    origin :
+        Reference point ``(lon0, lat0)`` in degrees.
+        Forward: if *None*, the first sample ``(a[0], b[0])`` is used.
+        Inverse: **required** — must match the origin used in the forward pass.
+    inverse :
+        If *False* (default): GPS → ENU.  If *True*: ENU → GPS.
+
+    Returns
+    -------
+    (c, d, origin_used) :
+        Forward: ``(x_east_m, y_north_m, (lon0, lat0))``
+        Inverse: ``(longitude, latitude, (lon0, lat0))``
+
+    Examples
+    --------
+    >>> x, y, origin = gps_enu(lon_arr, lat_arr)
+    >>> lon_back, lat_back, _ = gps_enu(x, y, origin=origin, inverse=True)
+    """
+    if not inverse:
+        # GPS → ENU
+        lon, lat = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+        if origin is None:
+            origin = (float(lon[0]), float(lat[0]))
+        lon0, lat0 = origin
+        cos_lat0 = np.cos(np.radians(lat0))
+        x_m = (lon - lon0) * EARTH_METERS_PER_DEGREE * cos_lat0
+        y_m = (lat - lat0) * EARTH_METERS_PER_DEGREE
+        return x_m, y_m, origin
+
+    # ENU → GPS
+    if origin is None:
+        msg = "origin=(lon0, lat0) is required for inverse conversion"
+        raise ValueError(msg)
+    x_m, y_m = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    lon0, lat0 = origin
+    cos_lat0 = np.cos(np.radians(lat0))
+    lon = x_m / (EARTH_METERS_PER_DEGREE * cos_lat0) + lon0
+    lat = y_m / EARTH_METERS_PER_DEGREE + lat0
+    return lon, lat, origin
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -180,7 +244,7 @@ class G2ClothoidFitResult:
 
     """
 
-    segments: list  # list[ClothoidSegment]
+    segments: list[ClothoidSegment]
     knot_indices: NDArray[np.int64]
     knot_s_m: NDArray[np.float64]
     knot_kappa: NDArray[np.float64]
@@ -193,6 +257,45 @@ class G2ClothoidFitResult:
     s_ref: NDArray[np.float64]
     x_ref: NDArray[np.float64]
     y_ref: NDArray[np.float64]
+
+    def resample(self, spacing_m: float = 0.5) -> dict:
+        """Sample the G2 clothoid chain at uniform arc-length spacing.
+
+        Parameters
+        ----------
+        spacing_m :
+            Approximate distance between consecutive output points [m].
+
+        Returns
+        -------
+        dict with keys:
+            x, y : NDArray[float64]
+                Cartesian positions (same frame as fit input).
+            kappa : NDArray[float64]
+                Curvature at each sample [1/m].
+            s : NDArray[float64]
+                Cumulative arc length [m].
+        """
+        xs, ys, ks, ss = [], [], [], []
+        s_cum = 0.0
+        for seg in self.segments:
+            n_pts = max(3, int(seg.length / spacing_m))
+            s_arr = np.linspace(0.0, seg.length, n_pts)
+            cc = _PYC_CC()
+            cc.build(seg.x0, seg.y0, seg.theta0, seg.kappa0, seg.sigma,
+                     seg.length)
+            s_list = s_arr.tolist()
+            xs.extend([cc.X(s) for s in s_list])
+            ys.extend([cc.Y(s) for s in s_list])
+            ks.extend([seg.kappa0 + seg.sigma * s for s in s_arr])
+            ss.extend((s_cum + s_arr).tolist())
+            s_cum += seg.length
+        return {
+            "x": np.asarray(xs),
+            "y": np.asarray(ys),
+            "kappa": np.asarray(ks),
+            "s": np.asarray(ss),
+        }
 
 
 class G2ClothoidApproximator:

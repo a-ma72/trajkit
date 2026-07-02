@@ -10,7 +10,7 @@ The Kalman smoothing mode fuses GPS position with wheel
 speed and yaw rate for sub-meter accuracy.
 """
 
-# ruff: noqa: C901, D107, PLR0912, PLR0913, PLR0915
+# ruff: noqa: C901, D107, PLC0415, PLR0912, PLR0913, PLR0915
 
 from __future__ import annotations
 
@@ -202,6 +202,8 @@ class GPSProcessor:
         speed_smoothing_window: int = 501,
         kalman_config: Mapping[str, object] | None = None,
         g2_config: Mapping[str, object] | None = None,
+        *,
+        freeze_repair: bool = False,
     ) -> None:
         self.v_max_kmh = v_max_kmh
         self.filter_order = filter_order
@@ -211,7 +213,7 @@ class GPSProcessor:
         self.speed_smoothing_window = speed_smoothing_window
         self.kalman_config = kalman_config
         self.g2_config = g2_config
-
+        self.freeze_repair = freeze_repair
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -224,9 +226,11 @@ class GPSProcessor:
         aux_channels: Mapping[str, NDArray[np.float64]] | None = None,
         yaw_rate_rad: NDArray[np.float64] | None = None,
         steering_angle_deg: NDArray[np.float64] | None = None,
+        lateral_acceleration_ms2: NDArray[np.float64] | None = None,
         abs_flag: NDArray[np.float64] | None = None,
         lon_int: NDArray[np.float64] | None = None,
         lat_int: NDArray[np.float64] | None = None,
+        gps_samplerate_hz: float | None = None,
     ) -> GPSTrack:
         """Run the full GPS conditioning pipeline.
 
@@ -252,6 +256,12 @@ class GPSProcessor:
             Steering wheel angle in degrees (signed). Used to derive
             yaw rate via bicycle model when ``yaw_rate_rad`` is not
             provided. Must have the same length as lon_raw.
+        lateral_acceleration_ms2 : NDArray[np.float64] | None, optional
+            Lateral acceleration in m/s² (signed). Used to derive
+            yaw rate when ``yaw_rate_rad`` is not provided. Must have
+            the same length as lon_raw.
+            Note: There is no filter applied to this channel; it is
+            assumed to be pre-conditioned.
         abs_flag : NDArray[np.float64] | None, optional
             Binary ABS-active flag (1 = active). When provided alongside
             ``steering_angle_deg``, wheel speed is clamped during ABS
@@ -267,6 +277,12 @@ class GPSProcessor:
         lat_int : NDArray[np.float64] | None, optional
             Integer part of latitude (e.g. rpc3 GPS_Y_Int). Same
             semantics as ``lon_int``; both must be provided together.
+        gps_samplerate_hz : float | None, optional
+            Optional nominal sample rate of the input arrays.
+            If provided, it is used to compute the effective GPS Nyquist
+            frequency for the Butterworth filter cutoff.
+            If None, the effective GPS Nyquist frequency is estimated
+            from the detected GPS update epochs.
 
         Returns
         -------
@@ -316,7 +332,14 @@ class GPSProcessor:
             lon_raw[no_fix] = np.nan
             lat_raw[no_fix] = np.nan
 
-        # Derive yaw rate from steering angle
+        # Interpolate wheel speed through ABS epochs (removes 15 Hz
+        # lock/unlock oscillation, preserves deceleration trend).
+        # Used for both bicycle-model yaw rate and Kalman speed input.
+        v_smooth = v_reference_ms
+        if abs_flag is not None:
+            v_smooth = self._clamp_speed_during_abs(v_reference_ms, abs_flag)
+
+        # Derive yaw rate from steering angle, optional
         if steering_angle_deg is not None:
             if yaw_rate_rad is not None:
                 logger.warning(
@@ -326,14 +349,22 @@ class GPSProcessor:
                 )
             _cfg = self.kalman_config or KalmanConfig(dt=1.0)
             delta_road_rad = np.radians(steering_angle_deg) / _cfg.steering_ratio
-            # During ABS, wheel speed oscillates (lock/unlock cycles at ~15 Hz).
-            # Clamp to last pre-ABS value for the bicycle model yaw rate.
-            v_for_yaw = v_reference_ms
-            if abs_flag is not None:
-                v_for_yaw = self._clamp_speed_during_abs(
-                    v_reference_ms, abs_flag,
+            yaw_rate_rad = v_smooth * np.tan(delta_road_rad) / _cfg.wheelbase_m
+
+        # Derive yaw rate from lateral acceleration, optional
+        if lateral_acceleration_ms2 is not None:
+            if yaw_rate_rad is not None:
+                logger.warning(
+                    "Both yaw_rate_rad and lateral_acceleration_ms2 provided; "
+                    "yaw_rate_rad will be overwritten by derivation from "
+                    "lateral_acceleration_ms2.",
                 )
-            yaw_rate_rad = v_for_yaw * np.tan(delta_road_rad) / _cfg.wheelbase_m
+            yaw_rate_rad = lateral_acceleration_ms2 / v_smooth
+
+        # Track whether yaw rate comes from a model (invalid during ABS)
+        # or from a direct sensor (valid during ABS).
+        _yr_from_model = (steering_angle_deg is not None
+                          or lateral_acceleration_ms2 is not None)
 
         # Step 1: Detect GPS update epochs
         update_idx = self._detect_updates(lon_raw, lat_raw)
@@ -348,14 +379,82 @@ class GPSProcessor:
         )
 
         # Step 3: Calibrate sampling rate
-        dt = self._calibrate_dt(lon_raw, lat_raw, update_idx, v_reference_ms)
-        fs = 1.0 / dt
+        if gps_samplerate_hz is not None:
+            dt = 1.0 / gps_samplerate_hz
+            fs = gps_samplerate_hz
+        else:
+            dt = self._calibrate_dt(lon_raw, lat_raw, update_idx, v_reference_ms)
+            fs = 1.0 / dt
+
+        # During ABS, inflate measurement noise for yaw rate (bicycle model
+        # invalid due to tire saturation) and wheel speed (interpolated
+        # v_smooth is only an approximation of true deceleration).
+        # A temporal margin + cosine ramp avoids transient kinks at the
+        # ABS flag edges (flag often lags behind actual wheel oscillation).
+        yaw_rate_noise_scale = None
+        speed_noise_scale = None
+        process_noise_scale = None
+        if abs_flag is not None:
+            abs_on = abs_flag > _ABS_FLAG_THRESHOLD
+            if abs_on.any():
+                # Extend ABS mask by margin (accounts for flag delay + state recovery)
+                margin_samples = int(1.0 / dt) if dt > 0 else 500  # ~1000 ms
+                ramp_samples = int(0.1 / dt) if dt > 0 else 50    # ~100 ms ramp
+                abs_extended = abs_on.copy()
+                # Dilate: extend True regions by margin on both sides
+                indices = np.where(abs_on)[0]
+                for idx in indices:
+                    lo = max(0, idx - margin_samples)
+                    hi = min(n, idx + margin_samples + 1)
+                    abs_extended[lo:hi] = True
+
+                # Build smooth ramp (0 outside ABS → 1.0 in interior)
+                # Only ABS regions get non-zero values; rest stays at 0.
+                scale_profile = np.zeros(n)
+                abs_idx = np.where(abs_extended)[0]
+                if len(abs_idx) > 0:
+                    # Find contiguous runs and apply cosine ramp at edges
+                    diffs = np.diff(abs_idx)
+                    breaks = np.where(diffs > 1)[0]
+                    run_starts = np.concatenate([[abs_idx[0]], abs_idx[breaks + 1]])
+                    run_ends = np.concatenate([abs_idx[breaks], [abs_idx[-1]]])
+                    for rs, re in zip(run_starts, run_ends, strict=False):
+                        # Ramp up at start
+                        ramp_len = min(ramp_samples, (re - rs) // 2)
+                        if ramp_len > 0:
+                            ramp_up = 0.5 * (1 - np.cos(np.pi * np.arange(ramp_len) / ramp_len))
+                            scale_profile[rs:rs + ramp_len] = ramp_up
+                            scale_profile[rs + ramp_len:re - ramp_len + 1] = 1.0
+                            # Ramp down at end
+                            ramp_dn = 0.5 * (1 + np.cos(np.pi * np.arange(ramp_len) / ramp_len))
+                            scale_profile[re - ramp_len + 1:re + 1] = ramp_dn
+                        else:
+                            scale_profile[rs:re + 1] = 1.0
+
+                if _yr_from_model:
+                    # Bicycle model / ay-derived ω: invalid during ABS
+                    # (tire saturation). Moderate inflation — enough to
+                    # distrust the model without causing gain discontinuities.
+                    yaw_rate_noise_scale = 1.0 + 48.0 * scale_profile  # 1→49 (7× σ)
+                    speed_noise_scale = 1.0 + 3.0 * scale_profile       # 1→4  (2× σ)
+                    process_noise_scale = 1.0 + 9.0 * scale_profile     # 1→10
+                else:
+                    # Direct sensor ω (ESP): valid during ABS.
+                    # Only mild inflation for speed (v_smooth approximate)
+                    # and Q (CTRV prediction with valid ω still reasonable).
+                    yaw_rate_noise_scale = None  # sensor is trustworthy
+                    speed_noise_scale = 1.0 + 3.0 * scale_profile       # 1→4
+                    process_noise_scale = 1.0 + 9.0 * scale_profile     # 1→10
+
 
         # Step 4: Position smoothing
         if self.smoothing in ("kalman", "kalman_jax", "g2"):
             lon_filt, lat_filt, speed_ms = self._apply_kalman(
-                lon_interp, lat_interp, v_reference_ms,
+                lon_interp, lat_interp, v_smooth,
                 yaw_rate_rad, update_idx, dt,
+                yaw_rate_noise_scale=yaw_rate_noise_scale,
+                speed_noise_scale=speed_noise_scale,
+                process_noise_scale=process_noise_scale,
             )
 
             # Step 4b: G2 clothoid spline (SolveG2) on Kalman output
@@ -1016,13 +1115,17 @@ class GPSProcessor:
         v_ms: NDArray[np.float64],
         abs_active: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Clamp wheel speed during ABS events to last pre-ABS value.
+        """Interpolate wheel speed across ABS events.
 
         During ABS intervention, wheel speed oscillates at ~15 Hz
-        (lock/unlock cycles). Using the oscillating speed in the
-        bicycle model produces large yaw rate spikes. Clamping to the
-        last pre-ABS value gives a physically plausible yaw rate
-        estimate for the duration of the braking event.
+        (lock/unlock cycles) around a value below the true vehicle
+        speed. Using the oscillating signal in the bicycle model
+        produces yaw rate spikes. Simple clamping to the last pre-ABS
+        value overestimates speed (vehicle is decelerating).
+
+        This method linearly interpolates between the last pre-ABS
+        and first post-ABS speed for each contiguous ABS epoch,
+        capturing the deceleration trend without oscillation.
 
         Parameters
         ----------
@@ -1034,17 +1137,25 @@ class GPSProcessor:
         Returns
         -------
         NDArray[np.float64]
-            Speed array with ABS epochs replaced by last pre-ABS value.
+            Speed array with ABS epochs linearly bridged.
 
         """
-        v_out = v_ms.copy()
         abs_on = abs_active > _ABS_FLAG_THRESHOLD
-        last_v = v_ms[0]
-        for i in range(len(v_ms)):
-            if abs_on[i]:
-                v_out[i] = last_v
-            else:
-                last_v = v_ms[i]
+        if not abs_on.any():
+            return v_ms
+
+        v_out = v_ms.copy()
+        # Indices where ABS is NOT active (valid anchor points)
+        valid_idx = np.where(~abs_on)[0]
+
+        if len(valid_idx) == 0:
+            # Entire signal is ABS — nothing to interpolate from
+            return v_out
+
+        # Linear interpolation: use non-ABS samples as anchors,
+        # interpolate through ABS epochs.
+        abs_idx = np.where(abs_on)[0]
+        v_out[abs_idx] = np.interp(abs_idx, valid_idx, v_ms[valid_idx])
         return v_out
 
     @staticmethod
@@ -1199,6 +1310,9 @@ class GPSProcessor:
         yaw_rate_rad: NDArray[np.float64] | None,
         update_idx: NDArray[np.intp],
         dt: float,
+        yaw_rate_noise_scale: NDArray[np.float64] | None = None,
+        speed_noise_scale: NDArray[np.float64] | None = None,
+        process_noise_scale: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
         """Apply Kalman EKF + RTS smoother for position conditioning.
 
@@ -1220,6 +1334,18 @@ class GPSProcessor:
             Indices of actual GPS updates (sparse, 5-20 Hz).
         dt : float
             Calibrated sampling period [s].
+        yaw_rate_noise_scale : NDArray or None
+            Optional per-sample yaw rate noise scaling factor.  When
+            provided, the yaw rate measurement noise is multiplied by this
+            factor (useful for inflating noise during ABS events).
+        speed_noise_scale : NDArray or None
+            Optional per-sample speed noise scaling factor.  When provided,
+            the speed measurement noise is multiplied by this factor
+            (useful for inflating noise during ABS events).
+        process_noise_scale : NDArray or None
+            Optional per-sample process noise scaling factor.  When provided,
+            the process noise covariance is multiplied by this factor
+            (useful for inflating noise during ABS events).
 
         Returns
         -------
@@ -1243,9 +1369,10 @@ class GPSProcessor:
             raise ValueError(msg)
 
         # Repair single-axis GPS freezes (interpolate frozen coordinate)
-        lon_interp, lat_interp = self._repair_gps_freezes(
-            lon_interp, lat_interp, update_idx, v_reference_ms
-        )
+        if self.freeze_repair:
+            lon_interp, lat_interp = self._repair_gps_freezes(
+                lon_interp, lat_interp, update_idx, v_reference_ms,
+            )
 
         # Build GPS update mask from ALL update indices (no epochs removed)
         n = len(lon_interp)
@@ -1282,6 +1409,9 @@ class GPSProcessor:
             v_reference_ms=v_reference_ms,
             yaw_rate_rad=yaw_rate_rad,
             gps_update_mask=gps_update_mask,
+            yaw_rate_noise_scale=yaw_rate_noise_scale,
+            speed_noise_scale=speed_noise_scale,
+            process_noise_scale=process_noise_scale,
         )
 
         return result.longitude, result.latitude, result.speed_ms

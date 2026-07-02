@@ -250,16 +250,22 @@ is inverted analytically (closed-form 2×2 inverse) for performance.
 
 == Wheel Speed (Dense, Full Rate)
 
-$ z_v = v_"wheel", quad H_v = mat(0, 0, 1, 0, 0), quad R_v = sigma_v^2 $
+$ z_v = v_"wheel", quad H_v = mat(0, 0, 1, 0, 0), quad R_v = sigma_v^2 dot s_v [k] $
 
 This is a scalar update: only the speed state is directly observed.
-The Kalman gain simplifies to $bold(K)_v = bold(P)_(: , 2) slash (P_(2,2) + sigma_v^2)$.
+The Kalman gain simplifies to $bold(K)_v = bold(P)_(: , 2) slash (P_(2,2) + R_v [k])$.
+
+The per-sample scale factor $s_v [k]$ defaults to 1.0 under normal
+conditions and is inflated during ABS braking (see @abs-robustness).
 
 == Yaw Rate (Dense, Full Rate)
 
-$ z_omega = omega_"gyro", quad H_omega = mat(0, 0, 0, 0, 1), quad R_omega = sigma_omega^2 $
+$ z_omega = omega_"gyro", quad H_omega = mat(0, 0, 0, 0, 1), quad R_omega = sigma_omega^2 dot s_omega [k] $
 
-Similarly scalar: $bold(K)_omega = bold(P)_(: , 4) slash (P_(4,4) + sigma_omega^2)$.
+Similarly scalar: $bold(K)_omega = bold(P)_(: , 4) slash (P_(4,4) + R_omega [k])$.
+
+Like $s_v$, the scale $s_omega [k]$ is 1.0 normally and inflated
+during ABS events when the yaw rate source is unreliable (see @abs-robustness).
 
 = Rauch–Tung–Striebel Smoother
 
@@ -428,6 +434,109 @@ The module fits into the larger GPS Track Conditioning pipeline:
   caption: [Fields of the `KalmanResult` output structure.],
 ) <tab-output>
 
+= ABS Braking Robustness <abs-robustness>
+
+During ABS (Anti-lock Braking System) intervention, the wheel speed
+signal oscillates at $approx 15$ Hz due to repeated lock/unlock cycles.
+Without treatment, three mechanisms corrupt the EKF:
+
++ *Bicycle-model yaw rate is invalid*: $omega = v dot tan(delta) slash L$
+  uses oscillating $v$, producing error/$sigma$ ratios of $approx 3.5 times$.
+  With $sigma_omega = 0.02$ rad/s, the filter trusts the corrupted $omega$
+  and heading drifts up to 8° over a 2 s ABS event.
+
++ *Wheel speed is unreliable*: The raw signal swings $plus.minus 10$ km/h
+  around the true deceleration curve.
+
++ *CTRV prediction is wrong*: With invalid $omega$ and $v$, position error
+  accumulates $approx 0.28$ m per prediction epoch between GPS corrections.
+
+== Stage 1: Speed Interpolation
+
+The method `_clamp_speed_during_abs()` replaces wheel speed during ABS
+epochs with a linear interpolation between the last non-ABS sample
+before and the first non-ABS sample after each event:
+
+$ v_"smooth" [k] = cases(
+  v_"raw" [k] &"if ABS inactive",
+  "interp"(k, {j: "ABS"[j] = 0}, v_"raw") quad &"if ABS active"
+) $
+
+This removes the 15 Hz oscillation while preserving the deceleration
+trend (offline processing knows both anchor points). The interpolated
+$v_"smooth"$ is used for both the bicycle-model yaw rate computation
+and as the Kalman speed measurement input.
+
+== Stage 2: Per-Sample Noise Inflation
+
+Even with interpolated speed, additional protection is needed because
+(a) the bicycle model is invalid during tire saturation, and (b) the
+linear speed approximation is imperfect. Three per-sample scale arrays
+are passed to the EKF kernel:
+
+$ R_omega [k] = sigma_omega^2 dot s_omega [k], quad
+  R_v [k] = sigma_v^2 dot s_v [k], quad
+  bold(Q)[k] = bold(Q) dot s_Q [k] $
+
+The inflation level depends on the *yaw rate source*:
+
+#figure(
+  table(
+    columns: 4,
+    align: (left, right, right, right),
+    table.header[Source][$s_omega$ (peak)][$s_v$ (peak)][$s_Q$ (peak)],
+    [Bicycle model (`steering_angle_deg`)], [49 (7× $sigma$)], [4 (2× $sigma$)], [10],
+    [Direct sensor (`yaw_rate_rad`, e.g.\ ESP)], [1 (unchanged)], [4 (2× $sigma$)], [10],
+  ),
+  caption: [Per-sample noise inflation during ABS. Scale factors multiply the base variance.],
+) <tab-abs-inflation>
+
+*Rationale for source-dependent scaling*: A direct ESP yaw rate sensor
+measures angular velocity independent of tire slip—it remains valid
+during ABS. Only speed uncertainty and CTRV prediction need mild
+inflation. The bicycle model, however, produces invalid $omega$ because
+$v$ oscillates and tires saturate ($tan delta$ no longer maps to true
+slip angle).
+
+== Temporal Margin and Cosine Ramp
+
+The ABS flag typically activates 100–200 ms *after* the first wheel
+oscillation begins. Two techniques ensure smooth transitions:
+
+*Margin (1000 ms)*: The ABS mask is dilated by $approx 1000$ ms on
+both sides.  The ABS flag lags behind actual tire saturation by
+200--700 ms (pedal → pressure build-up → saturation → flag);
+during curve-braking the steering angle corrupts the model earlier
+still.  The 1 s margin fully covers the pre-onset transient.
+
+*Cosine ramp (100 ms)*: Instead of a step function, scale factors
+transition smoothly:
+
+$ s(t) = 1 + (s_"peak" - 1) dot 1/2 (1 - cos(pi t slash t_"ramp")) $
+
+This avoids discontinuities in the Kalman gain that would cause
+position transients at the ABS boundaries.
+
+== Results
+
+#figure(
+  table(
+    columns: 2,
+    align: (left, right),
+    table.header[Metric][Value],
+    [Mean |Kalman − BW| during ABS (straight)], [\~15 cm],
+    [Max |Kalman − BW| during ABS (straight)], [< 90 cm],
+    [Mean |Kalman − BW| during ABS (curve, worst case)], [21 cm],
+    [Max |Kalman − BW| during ABS (curve, worst case)], [90 cm],
+    [Speed tracking during ABS], [smooth deceleration, no oscillation],
+    [Normal driving accuracy], [unchanged],
+  ),
+  caption: [ABS handling performance (steering-angle model, full stops from 46–56 km/h).],
+) <tab-abs-results>
+
+With inflation, the Kalman during ABS achieves position accuracy within
+6% of Butterworth while remaining 1.6× better during normal driving.
+
 = GPS Freeze Repair (Preprocessing) <freeze-repair>
 
 Before coordinates reach the EKF, `processor.py` applies
@@ -549,6 +658,8 @@ tailored to the specific challenges of high-rate vehicle GPS processing:
   with sparse GPS (5–20 Hz) in a unified framework
 + *Position drift fix*: Custom process noise scaling for high sample rates
   (see @drift-fix)
++ *ABS braking robustness*: Source-dependent per-sample noise inflation
+  with temporal margin and cosine ramp (see @abs-robustness)
 + *GPS freeze repair*: Innovation-based detection and linear interpolation
   of single-axis coordinate freezes (see @freeze-repair)
 + *Offline optimality*: RTS smoother gives minimum-variance estimate

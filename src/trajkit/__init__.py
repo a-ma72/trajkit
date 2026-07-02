@@ -8,6 +8,7 @@ from .clothoid import (
     G2ClothoidApproximator,
     G2ClothoidConfig,
     G2ClothoidFitResult,
+    gps_enu,
 )
 from .kalman import (
     GPSKalmanFilter,
@@ -25,6 +26,7 @@ __all__ = [
     "G2ClothoidApproximator",
     "G2ClothoidConfig",
     "G2ClothoidFitResult",
+    "gps_enu",
     "GPSKalmanFilter",
     "GPSProcessor",
     "GPSTrack",

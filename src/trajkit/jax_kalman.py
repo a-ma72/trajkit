@@ -267,6 +267,7 @@ class JAXKalmanFilter:
         yaw_rate_rad: NDArray[np.float64],
         gps_update_mask: NDArray[np.bool_],
         heading_init: float | None = None,
+        yaw_rate_mask: NDArray[np.bool_] | None = None,
     ) -> KalmanResult:
         """Run EKF + RTS via JAX/XLA.
 
@@ -324,12 +325,17 @@ class JAXKalmanFilter:
             cfg.sigma_yaw_rate**2,
         ]))
 
+        # Default: trust yaw rate for all samples
+        if yaw_rate_mask is None:
+            yaw_rate_mask = np.ones(len(longitude), dtype=np.bool_)
+
         # Transfer to JAX arrays
         gps_x_j = jnp.asarray(gps_x)
         gps_y_j = jnp.asarray(gps_y)
         v_ref_j = jnp.asarray(v_reference_ms)
         yr_j = jnp.asarray(yaw_rate_rad)
         mask_j = jnp.asarray(gps_update_mask)
+        yr_mask_j = jnp.asarray(yaw_rate_mask)
 
         # Run JIT-compiled EKF
         states_out, P_diag = _ekf_forward_rts_jax(
