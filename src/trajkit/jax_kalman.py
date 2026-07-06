@@ -1,8 +1,14 @@
 """JAX-accelerated Extended Kalman Filter for GPS/IMU fusion.
 
-Drop-in replacement for the Numba-based EKF in ``kalman.py``.
-Uses ``jax.lax.scan`` for the forward pass and RTS smoother,
+Numerically-aligned alternative to the Numba-based EKF in ``kalman.py``:
+same CTRV motion model, position-drift fix, and speed-dependent GPS noise
+scaling. Uses ``jax.lax.scan`` for the forward pass and RTS smoother,
 allowing XLA compilation and GPU execution.
+
+Not yet at full parity with ``kalman.py``: this module does not support
+the per-sample measurement/process-noise scaling used for ABS robustness
+(``speed_noise_scale`` / ``yaw_rate_noise_scale`` / ``process_noise_scale``
+in :meth:`GPSKalmanFilter.run`). Use the Numba backend for ABS events.
 
 Usage::
 
@@ -62,7 +68,9 @@ def _ekf_forward_rts_jax(
     gps_mask: jax.Array,
     dt: float,
     Q: jax.Array,
-    R_gps: jax.Array,
+    sigma_pos_gps: float,
+    gps_low_speed_gain: float,
+    gps_low_speed_v_scale: float,
     r_v: float,
     r_omega: float,
     state0: jax.Array,
@@ -157,7 +165,16 @@ def _ekf_forward_rts_jax(
         state = state + K_w * innov_w
         P = P - jnp.outer(K_w, P[4, :])
 
-        # Update: GPS (conditional via mask)
+        # Update: GPS (conditional via mask). Measurement noise is
+        # speed-dependent to suppress standstill multipath jitter, mirroring
+        # the Numba implementation (kalman.py): sigma_eff grows at low speed
+        # via an exponential decay, using the speed *after* the wheel-speed
+        # and yaw-rate updates above.
+        v_cur = jnp.abs(state[2])
+        sigma_gps_eff = sigma_pos_gps * (
+            1.0 + gps_low_speed_gain * jnp.exp(-v_cur / gps_low_speed_v_scale)
+        )
+        R_gps = jnp.eye(2) * sigma_gps_eff**2
         innov_gps = jnp.array([gx - state[0], gy - state[1]])
         S_gps = P[:2, :2] + R_gps
         S_gps_inv = jnp.linalg.inv(S_gps)
@@ -239,8 +256,16 @@ def _ekf_forward_rts_jax(
 class JAXKalmanFilter:
     """JAX-accelerated EKF for GPS track smoothing.
 
-    Drop-in replacement for :class:`GPSKalmanFilter` using JAX/XLA.
-    Automatically uses GPU if available.
+    Numerically-aligned alternative to :class:`GPSKalmanFilter` (Numba)
+    using JAX/XLA: same CTRV model, position-drift fix
+    (``sigma_pos_drift``), and speed-dependent GPS noise scaling
+    (``gps_low_speed_gain``/``gps_low_speed_v_scale``). Automatically uses
+    GPU if available.
+
+    Not yet supported here: per-sample ABS noise-inflation scaling
+    (``speed_noise_scale``/``yaw_rate_noise_scale``/``process_noise_scale``
+    on :meth:`GPSKalmanFilter.run`) — use the Numba backend for ABS
+    events.
 
     Parameters
     ----------
@@ -299,9 +324,10 @@ class JAXKalmanFilter:
         sya2 = cfg.sigma_yaw_acc**2
 
         Q = jnp.zeros((5, 5))
-        Q = Q.at[0, 0].set(dt4 / 4 * sa2)
+        sigma_drift2 = cfg.sigma_pos_drift**2
+        Q = Q.at[0, 0].set(dt4 / 4 * sa2 + sigma_drift2 * dt)
         Q = Q.at[0, 2].set(dt3 / 2 * sa2)
-        Q = Q.at[1, 1].set(dt4 / 4 * sa2)
+        Q = Q.at[1, 1].set(dt4 / 4 * sa2 + sigma_drift2 * dt)
         Q = Q.at[1, 2].set(dt3 / 2 * sa2)
         Q = Q.at[2, 0].set(dt3 / 2 * sa2)
         Q = Q.at[2, 1].set(dt3 / 2 * sa2)
@@ -310,8 +336,6 @@ class JAXKalmanFilter:
         Q = Q.at[3, 4].set(dt * sya2)
         Q = Q.at[4, 3].set(dt * sya2)
         Q = Q.at[4, 4].set(sya2)
-
-        R_gps = jnp.eye(2) * cfg.sigma_pos_gps**2
 
         state0 = jnp.array([
             gps_x[0], gps_y[0], v_reference_ms[0],
@@ -326,6 +350,8 @@ class JAXKalmanFilter:
         ]))
 
         # Default: trust yaw rate for all samples
+        # NOTE: yaw_rate_mask is accepted for API compatibility but is not
+        # yet wired into _ekf_forward_rts_jax — it currently has no effect.
         if yaw_rate_mask is None:
             yaw_rate_mask = np.ones(len(longitude), dtype=np.bool_)
 
@@ -340,7 +366,10 @@ class JAXKalmanFilter:
         # Run JIT-compiled EKF
         states_out, P_diag = _ekf_forward_rts_jax(
             gps_x_j, gps_y_j, v_ref_j, yr_j, mask_j,
-            dt, Q, R_gps,
+            dt, Q,
+            cfg.sigma_pos_gps,
+            cfg.gps_low_speed_gain,
+            cfg.gps_low_speed_v_scale,
             cfg.sigma_v_wheel**2,
             cfg.sigma_yaw_rate**2,
             state0, P0,

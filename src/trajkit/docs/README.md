@@ -120,13 +120,15 @@ GPSTrack (dataclass)
   resolves it to `'kalman+g2'` (logged via `logger.info`) unless a
   position-smoothing backend is already given explicitly, e.g.
   `smoothing='kalman_jax+g2'` or `smoothing='butterworth+g2'`.
-- ⚠️ **`kalman_jax` is not yet numerically equivalent to `kalman`**: it
-  omits the position-drift fix (`sigma_pos_drift`) and the speed-dependent
-  GPS noise scaling (`gps_low_speed_gain`/`gps_low_speed_v_scale`), and it
-  does not support the ABS noise-inflation hooks. See
-  `docs/kalman_description.typ` § "JAX Backend Parity" for details. Use
-  `kalman` for production tracks with high sample rates, standstill
-  segments, or ABS events.
+- ⚠️ **`kalman_jax` does not support ABS noise-inflation scaling**: the
+  position-drift fix and speed-dependent GPS noise scaling are now ported
+  and numerically match `kalman` (verified to floating-point precision on
+  a synthetic benchmark). The per-sample `speed_noise_scale` /
+  `yaw_rate_noise_scale` / `process_noise_scale` used for ABS robustness
+  are Numba-only for now; combining `smoothing='kalman_jax'` with
+  `abs_flag` logs a warning and silently skips the ABS noise inflation.
+  See `docs/kalman_description.typ` § "JAX Backend Parity" for details.
+  Use `kalman` for tracks with ABS events.
 
 ## API Reference
 
@@ -540,13 +542,13 @@ track = proc.process(
 
 ## Known Limitations
 
-- **`kalman_jax` is not a numerical drop-in for `kalman`.** It omits the
-  position-drift fix (`sigma_pos_drift`) and the speed-dependent GPS noise
-  scaling (`gps_low_speed_gain`/`gps_low_speed_v_scale`), and it does not
-  accept the ABS noise-inflation arguments
+- **`kalman_jax` does not accept the ABS noise-inflation arguments**
   (`speed_noise_scale`/`yaw_rate_noise_scale`/`process_noise_scale`).
-  Prefer `kalman` for high sample rates, standstill segments, or ABS
-  events until these are ported.
+  The position-drift fix and speed-dependent GPS noise scaling are
+  ported and match `kalman` numerically; `GPSProcessor` logs a warning
+  and skips ABS noise inflation if `smoothing='kalman_jax'` is combined
+  with `abs_flag`. Prefer `kalman` for tracks with ABS events until this
+  is ported.
 - **ABS noise inflation currently covers only the wheel-speed channel.**
   `GPSKalmanFilter.run()` supports per-sample yaw-rate and process-noise
   scaling as well, but `GPSProcessor.process()` does not populate them
