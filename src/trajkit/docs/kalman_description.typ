@@ -367,30 +367,43 @@ The `run()` method performs:
 
 `jax_kalman.py` provides `JAXKalmanFilter` as an XLA/GPU-capable
 alternative (`smoothing='kalman_jax'`), sharing the same `KalmanConfig`
-and `KalmanResult` types. As of this revision it is numerically aligned
-with `GPSKalmanFilter` on the two mechanisms this document treats as
-essential for high-rate vehicle GPS:
+and `KalmanResult` types. It is now numerically aligned with
+`GPSKalmanFilter` on every mechanism this document describes:
 
-- *Position-drift fix ported*: the JAX process-noise matrix $bold(Q)$
-  now includes the $sigma_"drift"^2 dot Delta t$ term from @drift-fix.
-- *Speed-dependent GPS noise ported*: the JAX GPS measurement covariance
-  is recomputed every step from the post-update speed state using the
-  same $sigma_"GPS,eff"(v)$ formula as @tab-dynamic-gps
-  (`gps_low_speed_gain`, `gps_low_speed_v_scale`).
+- *Position-drift fix*: the JAX process-noise matrix $bold(Q)$ includes
+  the $sigma_"drift"^2 dot Delta t$ term from @drift-fix.
+- *Speed-dependent GPS noise*: the JAX GPS measurement covariance is
+  recomputed every step from the post-update speed state using the same
+  $sigma_"GPS,eff"(v)$ formula as @tab-dynamic-gps (`gps_low_speed_gain`,
+  `gps_low_speed_v_scale`).
+- *Per-sample ABS noise scaling*: `JAXKalmanFilter.run()` accepts
+  `speed_noise_scale` / `yaw_rate_noise_scale` / `process_noise_scale`
+  with identical semantics to `GPSKalmanFilter.run()` — the per-sample
+  arrays are threaded through `jax.lax.scan` as scan inputs (rather than
+  closed-over scalars) so each step uses its own noise multiplier,
+  mirroring `r_v_arr` / `r_omega_arr` / `q_scale_arr` in the Numba
+  implementation (@abs-robustness).
 
-A direct numerical comparison on a synthetic track with a standstill
-segment and sparse GPS ($f_s slash f_"GPS" = 100$) showed agreement to
-within floating-point precision ($< 3 times 10^(-13)$ m) between the two
-backends after this change, versus a few centimetres of systematic
-divergence before it.
+A direct numerical comparison on synthetic tracks — including a
+standstill segment with sparse GPS ($f_s slash f_"GPS" = 100$) and an
+ABS-style speed-noise inflation window — showed agreement to within
+floating-point precision ($< 5 times 10^(-13)$ m) between the two
+backends on all three scaling arguments, versus measurable systematic
+divergence before this change.
 
-*Remaining gap*: `JAXKalmanFilter.run()` still does not accept
-`speed_noise_scale` / `yaw_rate_noise_scale` / `process_noise_scale` — the
-per-sample scaling used for ABS robustness (@abs-robustness) is Numba-only
-for now. `GPSProcessor` detects this at runtime and logs a warning rather
-than raising, dropping the requested scaling when `smoothing='kalman_jax'`
-is combined with `abs_flag`. Prefer the Numba backend
-(`smoothing='kalman'`) for tracks with ABS events until this is ported.
+*JAX-only extension*: `JAXKalmanFilter.run()` additionally accepts
+`yaw_rate_mask`, a boolean array with no Numba equivalent. Where
+`False`, the yaw-rate measurement update is skipped entirely for that
+sample (a hard gate), rather than merely down-weighted as
+`yaw_rate_noise_scale` does. On a synthetic test with a 400-sample yaw
+sensor fault (a false $+2$ rad/s offset), masking the corrupted window
+kept the peak heading error at $0.002 degree$ versus $48 degree$ without
+masking. This is useful when fault detection can identify *specific*
+bad samples (e.g. sensor self-test flags) rather than a general
+confidence level.
+
+Both backends can now be used interchangeably for every scenario this
+document covers, including ABS events.
 
 = Tuning Parameters <tuning>
 

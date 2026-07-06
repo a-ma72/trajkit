@@ -113,22 +113,20 @@ GPSTrack (dataclass)
 |------|---------|--------------|---------|----------|
 | `butterworth` | SciPy | WHEEL_SPEED_KMH (pass-through) | ≈ 0s | Quick visualization, position-only |
 | `kalman` | Numba | EKF state | 4.1s (850k) | Production: best accuracy |
-| `kalman_jax` | JAX/XLA | EKF state | 7.7s CPU / ~0.5s GPU | GPU clusters, batch vmap ⚠️ see note below |
+| `kalman_jax` | JAX/XLA | EKF state | 7.7s CPU / ~0.5s GPU | GPU clusters, batch vmap |
 | `g2` | Numba + SciPy | EKF state | ~3 s / 4 km | G2 clothoid chain (Bertolazzi-Frego SolveG2, max < 0.5 m) |
 
 - `smoothing='g2'` implies Kalman pre-filtering: `GPSProcessor` automatically
   resolves it to `'kalman+g2'` (logged via `logger.info`) unless a
   position-smoothing backend is already given explicitly, e.g.
   `smoothing='kalman_jax+g2'` or `smoothing='butterworth+g2'`.
-- ⚠️ **`kalman_jax` does not support ABS noise-inflation scaling**: the
-  position-drift fix and speed-dependent GPS noise scaling are now ported
-  and numerically match `kalman` (verified to floating-point precision on
-  a synthetic benchmark). The per-sample `speed_noise_scale` /
-  `yaw_rate_noise_scale` / `process_noise_scale` used for ABS robustness
-  are Numba-only for now; combining `smoothing='kalman_jax'` with
-  `abs_flag` logs a warning and silently skips the ABS noise inflation.
-  See `docs/kalman_description.typ` § "JAX Backend Parity" for details.
-  Use `kalman` for tracks with ABS events.
+- `kalman_jax` is numerically aligned with `kalman`, including ABS noise
+  inflation: the position-drift fix, speed-dependent GPS noise scaling,
+  and per-sample `speed_noise_scale`/`yaw_rate_noise_scale`/
+  `process_noise_scale` are all ported and verified to match `kalman` to
+  floating-point precision on synthetic benchmarks (see
+  `docs/kalman_description.typ` § "JAX Backend Parity"). Both backends
+  can be used interchangeably, including with `abs_flag`.
 
 ## API Reference
 
@@ -389,6 +387,15 @@ This is handled automatically when passing `steering_angle_deg` to `process()`.
 If both `steering_angle_deg` and `yaw_rate_rad` are provided, `steering_angle_deg`
 takes priority and a warning is logged.
 
+**JAX-only extension**: calling `JAXKalmanFilter.run()` directly (not
+through `GPSProcessor`) accepts an additional `yaw_rate_mask` boolean
+array with no Numba equivalent. Where `False`, the yaw-rate measurement
+update is skipped entirely for that sample — a hard gate for known-bad
+segments (e.g. a sensor self-test flag), as opposed to
+`yaw_rate_noise_scale`, which only de-weights it. See
+`docs/kalman_description.typ` § "JAX Backend Parity" for a worked
+example.
+
 ### ABS Braking Robustness
 
 During ABS braking, wheel speed (WHEEL_SPEED_KMH) oscillates at ~15 Hz from
@@ -542,17 +549,13 @@ track = proc.process(
 
 ## Known Limitations
 
-- **`kalman_jax` does not accept the ABS noise-inflation arguments**
-  (`speed_noise_scale`/`yaw_rate_noise_scale`/`process_noise_scale`).
-  The position-drift fix and speed-dependent GPS noise scaling are
-  ported and match `kalman` numerically; `GPSProcessor` logs a warning
-  and skips ABS noise inflation if `smoothing='kalman_jax'` is combined
-  with `abs_flag`. Prefer `kalman` for tracks with ABS events until this
-  is ported.
-- **ABS noise inflation currently covers only the wheel-speed channel.**
-  `GPSKalmanFilter.run()` supports per-sample yaw-rate and process-noise
-  scaling as well, but `GPSProcessor.process()` does not populate them
-  yet — no benchmark exists for those paths.
+- **`GPSProcessor.process()` only builds `speed_noise_scale` for ABS
+  events**, not `yaw_rate_noise_scale` or `process_noise_scale`. Both
+  `GPSKalmanFilter` and `JAXKalmanFilter` support all three per-sample
+  scaling arrays (numerically matching each other — see
+  `docs/kalman_description.typ` § "JAX Backend Parity"), but the
+  processor pipeline doesn't populate the latter two yet, and no
+  benchmark exists for that combination.
 - **No automated test suite yet** (tracked above under Future Extensions);
   changes to the pipeline are currently verified manually.
 - **`EARTH_METERS_PER_DEGREE` is a single fixed constant** (111,139.0

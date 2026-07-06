@@ -1,14 +1,17 @@
 """JAX-accelerated Extended Kalman Filter for GPS/IMU fusion.
 
 Numerically-aligned alternative to the Numba-based EKF in ``kalman.py``:
-same CTRV motion model, position-drift fix, and speed-dependent GPS noise
-scaling. Uses ``jax.lax.scan`` for the forward pass and RTS smoother,
-allowing XLA compilation and GPU execution.
+same CTRV motion model, position-drift fix, speed-dependent GPS noise
+scaling, and per-sample measurement/process-noise scaling for ABS
+robustness (``speed_noise_scale`` / ``yaw_rate_noise_scale`` /
+``process_noise_scale``, matching :meth:`GPSKalmanFilter.run`). Uses
+``jax.lax.scan`` for the forward pass and RTS smoother, allowing XLA
+compilation and GPU execution.
 
-Not yet at full parity with ``kalman.py``: this module does not support
-the per-sample measurement/process-noise scaling used for ABS robustness
-(``speed_noise_scale`` / ``yaw_rate_noise_scale`` / ``process_noise_scale``
-in :meth:`GPSKalmanFilter.run`). Use the Numba backend for ABS events.
+Additionally supports ``yaw_rate_mask`` (JAX-only, no Numba equivalent):
+a boolean array that skips the yaw-rate measurement update entirely for
+samples where it is ``False``, rather than merely de-weighting it via
+``yaw_rate_noise_scale``.
 
 Usage::
 
@@ -66,13 +69,15 @@ def _ekf_forward_rts_jax(
     v_ref: jax.Array,
     yaw_rate: jax.Array,
     gps_mask: jax.Array,
+    yaw_rate_mask: jax.Array,
+    r_v_arr: jax.Array,
+    r_omega_arr: jax.Array,
+    q_scale_arr: jax.Array,
     dt: float,
     Q: jax.Array,
     sigma_pos_gps: float,
     gps_low_speed_gain: float,
     gps_low_speed_v_scale: float,
-    r_v: float,
-    r_omega: float,
     state0: jax.Array,
     P0: jax.Array,
     *,
@@ -86,6 +91,7 @@ def _ekf_forward_rts_jax(
     def _predict(
         state: jax.Array,
         P: jax.Array,
+        q_scale_k: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         x_s, y_s, v, theta, omega = state
 
@@ -132,38 +138,45 @@ def _ekf_forward_rts_jax(
         ))
         F = F.at[3, 4].set(dt)
 
-        P_pred = F @ P @ F.T + Q
+        P_pred = F @ P @ F.T + Q * q_scale_k
         return state_pred, P_pred, F
 
     # --- Forward scan body ---
     def _forward_step(
         carry: tuple[jax.Array, jax.Array],
-        inputs: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+        inputs: tuple[
+            jax.Array, jax.Array, jax.Array, jax.Array, jax.Array,
+            jax.Array, jax.Array, jax.Array, jax.Array,
+        ],
     ) -> tuple[
         tuple[jax.Array, jax.Array],
         tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
     ]:
         state, P = carry
-        gx, gy, v_r, yr, g_mask = inputs
+        gx, gy, v_r, yr, g_mask, yr_mask_k, r_v_k, r_omega_k, q_scale_k = inputs
 
         # Predict
-        state_pred, P_pred, F = _predict(state, P)
+        state_pred, P_pred, F = _predict(state, P, q_scale_k)
         state = state_pred
         P = P_pred
 
-        # Update: wheel speed
+        # Update: wheel speed (per-sample noise, inflated during ABS via
+        # r_v_k = sigma_v_wheel**2 * speed_noise_scale[k])
         innov_v = v_r - state[2]
-        S_v = P[2, 2] + r_v
+        S_v = P[2, 2] + r_v_k
         K_v = P[:, 2] / S_v
         state = state + K_v * innov_v
         P = P - jnp.outer(K_v, P[2, :])
 
-        # Update: yaw rate
+        # Update: yaw rate (per-sample noise; update itself is skipped
+        # where yaw_rate_mask is False, mirroring the GPS mask below)
         innov_w = yr - state[4]
-        S_w = P[4, 4] + r_omega
+        S_w = P[4, 4] + r_omega_k
         K_w = P[:, 4] / S_w
-        state = state + K_w * innov_w
-        P = P - jnp.outer(K_w, P[4, :])
+        state_yr = state + K_w * innov_w
+        P_yr = P - jnp.outer(K_w, P[4, :])
+        state = jnp.where(yr_mask_k, state_yr, state)
+        P = jnp.where(yr_mask_k, P_yr, P)
 
         # Update: GPS (conditional via mask). Measurement noise is
         # speed-dependent to suppress standstill multipath jitter, mirroring
@@ -191,7 +204,10 @@ def _ekf_forward_rts_jax(
         return carry, outputs
 
     # Run forward pass
-    inputs = (gps_x[1:], gps_y[1:], v_ref[1:], yaw_rate[1:], gps_mask[1:])
+    inputs = (
+        gps_x[1:], gps_y[1:], v_ref[1:], yaw_rate[1:], gps_mask[1:],
+        yaw_rate_mask[1:], r_v_arr[1:], r_omega_arr[1:], q_scale_arr[1:],
+    )
     init_carry = (state0, P0)
     _, (states_fwd_tail, P_fwd_tail, states_pred_tail, P_pred_tail, F_tail) = lax.scan(
         _forward_step, init_carry, inputs,
@@ -258,14 +274,12 @@ class JAXKalmanFilter:
 
     Numerically-aligned alternative to :class:`GPSKalmanFilter` (Numba)
     using JAX/XLA: same CTRV model, position-drift fix
-    (``sigma_pos_drift``), and speed-dependent GPS noise scaling
-    (``gps_low_speed_gain``/``gps_low_speed_v_scale``). Automatically uses
-    GPU if available.
-
-    Not yet supported here: per-sample ABS noise-inflation scaling
-    (``speed_noise_scale``/``yaw_rate_noise_scale``/``process_noise_scale``
-    on :meth:`GPSKalmanFilter.run`) — use the Numba backend for ABS
-    events.
+    (``sigma_pos_drift``), speed-dependent GPS noise scaling
+    (``gps_low_speed_gain``/``gps_low_speed_v_scale``), and per-sample
+    measurement/process-noise scaling for ABS robustness
+    (``speed_noise_scale``/``yaw_rate_noise_scale``/``process_noise_scale``,
+    matching :meth:`GPSKalmanFilter.run`). Automatically uses GPU if
+    available.
 
     Parameters
     ----------
@@ -293,10 +307,17 @@ class JAXKalmanFilter:
         gps_update_mask: NDArray[np.bool_],
         heading_init: float | None = None,
         yaw_rate_mask: NDArray[np.bool_] | None = None,
+        yaw_rate_noise_scale: NDArray[np.float64] | None = None,
+        speed_noise_scale: NDArray[np.float64] | None = None,
+        process_noise_scale: NDArray[np.float64] | None = None,
     ) -> KalmanResult:
         """Run EKF + RTS via JAX/XLA.
 
-        Parameters match :meth:`GPSKalmanFilter.run` exactly.
+        Parameters match :meth:`GPSKalmanFilter.run`, plus ``yaw_rate_mask``
+        (JAX-only): a boolean array where ``False`` skips the yaw-rate
+        measurement update entirely for that sample (e.g. known sensor
+        dropout), as opposed to ``yaw_rate_noise_scale`` which only
+        de-weights it.
         """
         cfg = self.config
 
@@ -350,10 +371,31 @@ class JAXKalmanFilter:
         ]))
 
         # Default: trust yaw rate for all samples
-        # NOTE: yaw_rate_mask is accepted for API compatibility but is not
-        # yet wired into _ekf_forward_rts_jax — it currently has no effect.
         if yaw_rate_mask is None:
             yaw_rate_mask = np.ones(len(longitude), dtype=np.bool_)
+
+        # Per-sample measurement/process noise (inflated during ABS, same
+        # semantics as GPSKalmanFilter.run(): scale=None -> no inflation)
+        n = len(longitude)
+        r_v_base = cfg.sigma_v_wheel ** 2
+        r_v_arr = (
+            r_v_base * np.asarray(speed_noise_scale, dtype=np.float64)
+            if speed_noise_scale is not None
+            else np.full(n, r_v_base)
+        )
+
+        r_omega_base = cfg.sigma_yaw_rate ** 2
+        r_omega_arr = (
+            r_omega_base * np.asarray(yaw_rate_noise_scale, dtype=np.float64)
+            if yaw_rate_noise_scale is not None
+            else np.full(n, r_omega_base)
+        )
+
+        q_scale_arr = (
+            np.asarray(process_noise_scale, dtype=np.float64)
+            if process_noise_scale is not None
+            else np.ones(n)
+        )
 
         # Transfer to JAX arrays
         gps_x_j = jnp.asarray(gps_x)
@@ -362,16 +404,18 @@ class JAXKalmanFilter:
         yr_j = jnp.asarray(yaw_rate_rad)
         mask_j = jnp.asarray(gps_update_mask)
         yr_mask_j = jnp.asarray(yaw_rate_mask)
+        r_v_arr_j = jnp.asarray(r_v_arr)
+        r_omega_arr_j = jnp.asarray(r_omega_arr)
+        q_scale_arr_j = jnp.asarray(q_scale_arr)
 
         # Run JIT-compiled EKF
         states_out, P_diag = _ekf_forward_rts_jax(
-            gps_x_j, gps_y_j, v_ref_j, yr_j, mask_j,
+            gps_x_j, gps_y_j, v_ref_j, yr_j, mask_j, yr_mask_j,
+            r_v_arr_j, r_omega_arr_j, q_scale_arr_j,
             dt, Q,
             cfg.sigma_pos_gps,
             cfg.gps_low_speed_gain,
             cfg.gps_low_speed_v_scale,
-            cfg.sigma_v_wheel**2,
-            cfg.sigma_yaw_rate**2,
             state0, P0,
             use_rts=cfg.use_rts_smoother,
         )

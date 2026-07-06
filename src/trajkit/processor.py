@@ -1536,41 +1536,19 @@ class GPSProcessor:
             cfg = KalmanConfig(dt=dt)
 
         kf = _FilterCls(cfg)
-
-        if self.smoothing == "kalman_jax":
-            # JAXKalmanFilter.run() does not (yet) accept per-sample
-            # measurement/process-noise scaling — see
-            # docs/kalman_description.typ § "JAX Backend Parity". Passing
-            # these kwargs through unconditionally would raise a TypeError,
-            # so they are dropped here; warn if the caller actually asked
-            # for ABS-style scaling so the silent accuracy loss is visible.
-            if any(
-                arr is not None
-                for arr in (speed_noise_scale, yaw_rate_noise_scale, process_noise_scale)
-            ):
-                logger.warning(
-                    "smoothing='kalman_jax' does not support per-sample "
-                    "measurement/process-noise scaling (e.g. ABS noise "
-                    "inflation); the requested scaling is being ignored. "
-                    "Use smoothing='kalman' for ABS-robust processing.",
-                )
-            result = kf.run(
-                longitude=lon_interp,
-                latitude=lat_interp,
-                v_reference_ms=v_reference_ms,
-                yaw_rate_rad=yaw_rate_rad,
-                gps_update_mask=gps_update_mask,
-            )
-        else:
-            result = kf.run(
-                longitude=lon_interp,
-                latitude=lat_interp,
-                v_reference_ms=v_reference_ms,
-                yaw_rate_rad=yaw_rate_rad,
-                gps_update_mask=gps_update_mask,
-                speed_noise_scale=speed_noise_scale,
-                yaw_rate_noise_scale=yaw_rate_noise_scale,
-                process_noise_scale=process_noise_scale,
-            )
+        # Both GPSKalmanFilter (Numba) and JAXKalmanFilter (JAX) now accept
+        # the same per-sample noise-scaling kwargs (see
+        # docs/kalman_description.typ § "JAX Backend Parity"), so a single
+        # unified call works for either backend.
+        result = kf.run(
+            longitude=lon_interp,
+            latitude=lat_interp,
+            v_reference_ms=v_reference_ms,
+            yaw_rate_rad=yaw_rate_rad,
+            gps_update_mask=gps_update_mask,
+            speed_noise_scale=speed_noise_scale,
+            yaw_rate_noise_scale=yaw_rate_noise_scale,
+            process_noise_scale=process_noise_scale,
+        )
 
         return result.longitude, result.latitude, result.speed_ms
