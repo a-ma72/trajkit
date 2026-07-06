@@ -51,7 +51,7 @@ except ImportError as _jax_err:
     )
     raise ImportError(msg) from _jax_err
 
-from .constants import EARTH_METERS_PER_DEGREE
+from .constants import meters_per_degree_lat, meters_per_degree_lon
 from .kalman import KalmanConfig, KalmanResult
 
 if TYPE_CHECKING:
@@ -321,11 +321,13 @@ class JAXKalmanFilter:
         """
         cfg = self.config
 
-        # Local coordinate frame
+        # Local coordinate frame (WGS84 ellipsoidal meters-per-degree at
+        # the local origin latitude, see trajkit.constants)
         lon0, lat0 = float(longitude[0]), float(latitude[0])
-        cos_lat0 = np.cos(np.radians(lat0))
-        gps_x = (longitude - lon0) * EARTH_METERS_PER_DEGREE * cos_lat0
-        gps_y = (latitude - lat0) * EARTH_METERS_PER_DEGREE
+        m_per_deg_lon = meters_per_degree_lon(lat0)
+        m_per_deg_lat = meters_per_degree_lat(lat0)
+        gps_x = (longitude - lon0) * m_per_deg_lon
+        gps_y = (latitude - lat0) * m_per_deg_lat
 
         # Initial heading
         if heading_init is None:
@@ -425,8 +427,8 @@ class JAXKalmanFilter:
         P_diag_np = np.asarray(P_diag)
 
         # Convert to geo
-        lon_out = states_np[:, 0] / (EARTH_METERS_PER_DEGREE * cos_lat0) + lon0
-        lat_out = states_np[:, 1] / EARTH_METERS_PER_DEGREE + lat0
+        lon_out = states_np[:, 0] / m_per_deg_lon + lon0
+        lat_out = states_np[:, 1] / m_per_deg_lat + lat0
 
         return KalmanResult(
             x_m=states_np[:, 0],

@@ -308,19 +308,39 @@ typical of causal filters.
 GPS coordinates (longitude, latitude in degrees) are converted to a
 local tangent-plane approximation:
 
-$ x_"ENU" = ("lon" - "lon"_0) dot M_"earth" dot cos("lat"_0) $
-$ y_"ENU" = ("lat" - "lat"_0) dot M_"earth" $
+$ x_"ENU" = ("lon" - "lon"_0) dot M_"lon"("lat"_0) $
+$ y_"ENU" = ("lat" - "lat"_0) dot M_"lat"("lat"_0) $
 
-where $M_"earth" = 111 space 139.0$ m/° is the meters-per-degree
-constant used throughout trajkit (`EARTH_METERS_PER_DEGREE` in
-`constants.py`). This is a fixed approximation rather than a
-latitude-dependent WGS84 value (the exact meters-per-degree of
-latitude varies from about 110,574 m at the equator to 111,694 m at
-the poles); the inverse conversion is applied
-to produce the final output in geographic coordinates.
+where $M_"lat"(phi)$ and $M_"lon"(phi)$ are the WGS84 ellipsoidal
+meters-per-degree of latitude and longitude at reference latitude $phi
+= "lat"_0$ (Snyder, *Map Projections: A Working Manual*, USGS
+Professional Paper 1395, 1987):
+
+$ M_"lat"(phi) = 111 space 132.92 - 559.82 cos(2phi) + 1.175 cos(4phi) - 0.0023 cos(6phi) $
+$ M_"lon"(phi) = 111 space 412.84 cos(phi) - 93.5 cos(3phi) + 0.118 cos(5phi) $
+
+implemented as `meters_per_degree_lat()` / `meters_per_degree_lon()` in
+`constants.py`. Unlike the single global constant
+`EARTH_METERS_PER_DEGREE` = 111,319.49 m/° (kept for backward
+compatibility — it equals $M_"lon"(0)$, the equatorial value), these two
+functions are accurate across the full latitude range: true
+meters-per-degree of latitude varies from about 110,574 m at the equator
+to 111,694 m at the poles, a $approx 1%$ spread that a single constant
+cannot capture. Every coordinate-conversion site in trajkit (`kalman.py`,
+`jax_kalman.py`, `clothoid.py`'s `gps_enu()`, and the sampling/repair
+helpers in `processor.py`) evaluates $M_"lat"$/$M_"lon"$ at the locally
+relevant reference latitude — typically the track's first fix, or the
+segment mean where a per-segment reference is more appropriate (e.g.
+`_calibrate_dt`, `_repair_gps_freezes`) — rather than using the fixed
+constant.  The inverse conversion uses the same two functions evaluated
+at the same reference latitude, to produce the final output in geographic
+coordinates.
 
 This flat-Earth approximation introduces negligible error for
-trajectories spanning < 50 km from the origin.
+trajectories spanning < 50 km from the origin; the latitude-dependent
+$M_"lat"$/$M_"lon"$ remove the residual $approx 0.1$–$0.2%$ systematic
+scale error that a single global constant would otherwise introduce at
+non-equatorial latitudes.
 
 = Implementation Architecture
 
@@ -582,13 +602,20 @@ scale), i.e. a $20 times$ inflation of $sigma_(v,"wheel")$.
   channel, versus a parallel filter, a crossfade schedule, and a
   re-entry correction.
 
-*Current scope*: only the wheel-speed channel is inflated by the processor
-pipeline today. The EKF (`_ekf_forward_rts`) also accepts per-sample scale
-arrays for the yaw-rate measurement noise and for the process noise $Q$
-(`yaw_rate_noise_scale`, `process_noise_scale` in
-`GPSKalmanFilter.run()`), but `GPSProcessor.process()` does not currently
-populate them — they are available for callers who need finer control but
-are not exercised by the default ABS handling.
+*Current scope*: the ABS handling itself only ever inflates the
+wheel-speed channel automatically, by design — not as an unfinished
+feature. A direct-sensor yaw rate stays valid under tire saturation, and
+a bicycle-model-derived one already benefits from the Stage-1 speed
+interpolation, so there is no ABS-specific reason to distrust it;
+inflating the full process-noise $Q$ would reduce trust in *every*
+measurement rather than the one channel actually at fault. Both
+`GPSKalmanFilter.run()` and `JAXKalmanFilter.run()` nonetheless accept
+per-sample `yaw_rate_noise_scale` and `process_noise_scale` arrays (with
+identical semantics on both backends — @jax-parity), and
+`GPSProcessor.process()` exposes them as optional pass-through
+parameters for callers with an independent reason to distrust specific
+samples — e.g. a yaw sensor self-test flag, or a manoeuvre poorly
+captured by the CTRV model — unrelated to ABS.
 
 #figure(
   table(

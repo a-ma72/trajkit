@@ -10,13 +10,17 @@ from .clothoid import (
     G2ClothoidFitResult,
     gps_enu,
 )
+from .constants import (
+    EARTH_METERS_PER_DEGREE,
+    meters_per_degree_lat,
+    meters_per_degree_lon,
+)
 from .kalman import (
     GPSKalmanFilter,
     KalmanConfig,
     KalmanResult,
 )
 from .processor import (
-    EARTH_METERS_PER_DEGREE,
     GPSProcessor,
     GPSTrack,
 )
@@ -32,4 +36,6 @@ __all__ = [
     "GPSTrack",
     "KalmanConfig",
     "KalmanResult",
+    "meters_per_degree_lat",
+    "meters_per_degree_lon",
 ]

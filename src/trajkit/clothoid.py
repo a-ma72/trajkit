@@ -39,12 +39,13 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 from .constants import (
-    EARTH_METERS_PER_DEGREE,
     _LARGE_ERROR_SENTINEL,
     _SEG_BUILD_MIN_PTS,
     _SEG_EVAL_MIN_PTS,
     _SPEED_SQ_MIN,
     _UNI_GRID_MIN_PTS,
+    meters_per_degree_lat,
+    meters_per_degree_lon,
 )
 
 # ---------------------------------------------------------------------------
@@ -74,7 +75,10 @@ def gps_enu(
     """Convert between WGS84 geographic and local ENU coordinates.
 
     A single function for both directions of the flat-Earth tangent-plane
-    approximation used throughout trajkit.
+    approximation used throughout trajkit. Uses the WGS84 ellipsoidal
+    meters-per-degree at the reference latitude (see
+    :func:`trajkit.constants.meters_per_degree_lat`) rather than a single
+    global constant.
 
     Parameters
     ----------
@@ -105,9 +109,8 @@ def gps_enu(
         if origin is None:
             origin = (float(lon[0]), float(lat[0]))
         lon0, lat0 = origin
-        cos_lat0 = np.cos(np.radians(lat0))
-        x_m = (lon - lon0) * EARTH_METERS_PER_DEGREE * cos_lat0
-        y_m = (lat - lat0) * EARTH_METERS_PER_DEGREE
+        x_m = (lon - lon0) * meters_per_degree_lon(lat0)
+        y_m = (lat - lat0) * meters_per_degree_lat(lat0)
         return x_m, y_m, origin
 
     # ENU → GPS
@@ -116,9 +119,8 @@ def gps_enu(
         raise ValueError(msg)
     x_m, y_m = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     lon0, lat0 = origin
-    cos_lat0 = np.cos(np.radians(lat0))
-    lon = x_m / (EARTH_METERS_PER_DEGREE * cos_lat0) + lon0
-    lat = y_m / EARTH_METERS_PER_DEGREE + lat0
+    lon = x_m / meters_per_degree_lon(lat0) + lon0
+    lat = y_m / meters_per_degree_lat(lat0) + lat0
     return lon, lat, origin
 
 

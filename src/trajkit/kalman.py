@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numba import njit
 
-from .constants import EARTH_METERS_PER_DEGREE
+from .constants import meters_per_degree_lat, meters_per_degree_lon
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -353,10 +353,15 @@ def _ekf_forward_rts(
 def _geo_to_local(
     lon: NDArray, lat: NDArray, lon0: float, lat0: float,
 ) -> tuple[NDArray, NDArray]:
-    """Convert WGS84 to local ENU meters."""
-    cos_lat0 = np.cos(np.radians(lat0))
-    x_m = (lon - lon0) * EARTH_METERS_PER_DEGREE * cos_lat0
-    y_m = (lat - lat0) * EARTH_METERS_PER_DEGREE
+    """Convert WGS84 to local ENU meters.
+
+    Uses the WGS84 ellipsoidal meters-per-degree at the local origin
+    latitude ``lat0`` (see :func:`trajkit.constants.meters_per_degree_lat`)
+    rather than a single global constant, which is accurate to within
+    ~1% only near the equator.
+    """
+    x_m = (lon - lon0) * meters_per_degree_lon(lat0)
+    y_m = (lat - lat0) * meters_per_degree_lat(lat0)
     return x_m, y_m
 
 
@@ -364,9 +369,8 @@ def _local_to_geo(
     x_m: NDArray, y_m: NDArray, lon0: float, lat0: float,
 ) -> tuple[NDArray, NDArray]:
     """Convert local ENU meters back to WGS84."""
-    cos_lat0 = np.cos(np.radians(lat0))
-    lon = x_m / (EARTH_METERS_PER_DEGREE * cos_lat0) + lon0
-    lat = y_m / EARTH_METERS_PER_DEGREE + lat0
+    lon = x_m / meters_per_degree_lon(lat0) + lon0
+    lat = y_m / meters_per_degree_lat(lat0) + lat0
     return lon, lat
 
 

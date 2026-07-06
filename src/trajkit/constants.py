@@ -14,6 +14,8 @@ Sections
 
 from __future__ import annotations
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
 # Clothoid numerical guard constants
 # ---------------------------------------------------------------------------
@@ -93,8 +95,52 @@ for error statistics on very short terminal segments."""
 # Processor constants
 # ---------------------------------------------------------------------------
 
-EARTH_METERS_PER_DEGREE: float = 111_139.0
-"""Approximate meters per degree of latitude."""
+EARTH_METERS_PER_DEGREE: float = 111_319.49
+"""Meters per degree of longitude at the equator (WGS84 ellipsoidal
+approximation, see :func:`meters_per_degree_lon` at ``lat_deg=0``).
+
+Kept as a single constant for backward compatibility (some call sites
+historically used it for both axes without latitude correction). New
+code should prefer :func:`meters_per_degree_lat` /
+:func:`meters_per_degree_lon`, which are accurate across the full
+latitude range instead of only at the equator; the true meters-per-degree
+of *latitude* ranges from about 110,574 m at the equator to 111,694 m at
+the poles, a ~1% variation this single constant does not capture.
+"""
+
+
+def meters_per_degree_lat(lat_deg: float) -> float:
+    """Meters per degree of latitude at ``lat_deg`` [deg] (WGS84).
+
+    Ellipsoidal approximation (Snyder, *Map Projections: A Working
+    Manual*, USGS Professional Paper 1395, 1987), accurate to within a
+    few mm across the full latitude range. Vectorized: accepts scalars
+    or NumPy arrays.
+    """
+    phi = np.radians(lat_deg)
+    return (
+        111_132.92
+        - 559.82 * np.cos(2 * phi)
+        + 1.175 * np.cos(4 * phi)
+        - 0.0023 * np.cos(6 * phi)
+    )
+
+
+def meters_per_degree_lon(lat_deg: float) -> float:
+    """Meters per degree of longitude at ``lat_deg`` [deg] (WGS84).
+
+    Ellipsoidal approximation (same source as
+    :func:`meters_per_degree_lat`); replaces the common spherical
+    shortcut ``EARTH_METERS_PER_DEGREE * cos(lat)`` with the slightly
+    more accurate ellipsoidal formula. Vectorized: accepts scalars or
+    NumPy arrays.
+    """
+    phi = np.radians(lat_deg)
+    return (
+        111_412.84 * np.cos(phi)
+        - 93.5 * np.cos(3 * phi)
+        + 0.118 * np.cos(5 * phi)
+    )
 
 _SAVGOL_MIN_WINDOW: int = 51
 """Minimum Savgol filter window [samples].

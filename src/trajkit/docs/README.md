@@ -37,12 +37,15 @@ trajkit/                      (installed via: pip install -e /path/to/trajkit)
 │   ├── __init__.py      # Public API: GPSProcessor, GPSTrack, GPSKalmanFilter,
 │   │                    #   KalmanConfig, KalmanResult, gps_enu,
 │   │                    #   G2ClothoidApproximator, G2ClothoidConfig,
-│   │                    #   G2ClothoidFitResult
+│   │                    #   G2ClothoidFitResult, EARTH_METERS_PER_DEGREE,
+│   │                    #   meters_per_degree_lat, meters_per_degree_lon
 │   ├── processor.py     # GPSTrack (dataclass), GPSProcessor (main class)
 │   ├── kalman.py        # KalmanConfig, KalmanResult, GPSKalmanFilter (Numba/CPU)
 │   ├── jax_kalman.py    # JAXKalmanFilter (XLA/GPU-ready, lax.scan)
-│   └── clothoid.py      # gps_enu, ClothoidSegment, G2ClothoidApproximator,
-│                        #   G2ClothoidConfig, G2ClothoidFitResult (Bertolazzi-Frego SolveG2)
+│   ├── clothoid.py      # gps_enu, ClothoidSegment, G2ClothoidApproximator,
+│   │                    #   G2ClothoidConfig, G2ClothoidFitResult (Bertolazzi-Frego SolveG2)
+│   └── constants.py     # EARTH_METERS_PER_DEGREE, meters_per_degree_lat/lon,
+│                        #   shared numeric guard/sampling constants
 ├── docs/                # Typst technical documentation
 ├── notebooks/           # Usage examples
 └── pyproject.toml
@@ -155,7 +158,7 @@ Config objects and their defaults:
 
 All two default to `None`, in which case sensible defaults are used automatically.
 
-#### `.process(lon_raw, lat_raw, v_reference_ms, aux_channels=None, yaw_rate_rad=None, steering_angle_deg=None, lateral_acceleration_ms2=None, abs_flag=None, lon_int=None, lat_int=None, gps_samplerate_hz=None)`
+#### `.process(lon_raw, lat_raw, v_reference_ms, aux_channels=None, yaw_rate_rad=None, steering_angle_deg=None, lateral_acceleration_ms2=None, abs_flag=None, lon_int=None, lat_int=None, gps_samplerate_hz=None, yaw_rate_noise_scale=None, process_noise_scale=None)`
 
 Run the full pipeline. Returns `GPSTrack`.
 
@@ -200,6 +203,14 @@ Run the full pipeline. Returns `GPSTrack`.
   provided, `dt = 1/gps_samplerate_hz` is used directly instead of being
   auto-calibrated from the reference speed and detected GPS update
   epochs (see `_calibrate_dt()`).
+
+**Manual noise-scale overrides** (optional, `kalman`/`kalman_jax` only):
+- `yaw_rate_noise_scale`, `process_noise_scale` — per-sample multipliers
+  (same length as `lon_raw`) on the yaw-rate measurement variance and the
+  full process-noise covariance, respectively. Passed straight through to
+  `GPSKalmanFilter.run()`/`JAXKalmanFilter.run()`. Unlike `abs_flag`,
+  these are never derived automatically — see "ABS Braking Robustness"
+  below for why, and for a usage example.
 
 ### `G2ClothoidApproximator` (G2-continuous clothoid chain)
 
@@ -458,10 +469,29 @@ scale, i.e. ~20× in standard deviation).
 | `_ABS_POST_MARGIN_S` | 0.5 s |
 | `_ABS_RAMP_S` | 0.15 s |
 
-**Current scope**: only the wheel-speed channel is inflated by
-`GPSProcessor.process()` today. `GPSKalmanFilter.run()` also accepts
-`yaw_rate_noise_scale` and `process_noise_scale` for finer-grained control,
-but the processor pipeline does not currently populate them.
+**Current scope**: ABS handling automatically inflates only the
+wheel-speed channel, by design — not as an unfinished feature. A
+direct-sensor yaw rate stays valid under tire saturation, and a
+bicycle-model-derived one already benefits from the Stage 1 speed
+interpolation, so there's no ABS-specific reason to distrust it;
+inflating the full process noise would reduce trust in every
+measurement rather than the one channel actually at fault. Both
+`GPSKalmanFilter` and `JAXKalmanFilter` accept per-sample
+`yaw_rate_noise_scale` and `process_noise_scale` (numerically matching
+each other — see `docs/kalman_description.typ` § "JAX Backend Parity"),
+and `.process()` exposes them as optional pass-through parameters for
+callers with an independent reason to distrust specific samples — e.g. a
+yaw sensor self-test flag — unrelated to ABS:
+
+```python
+yaw_rate_noise_scale = np.ones(n)
+yaw_rate_noise_scale[fault_start:fault_end] = 50.0  # known-bad window
+
+track = proc.process(
+    lon, lat, v, steering_angle_deg=steer, abs_flag=abs_flag,
+    yaw_rate_noise_scale=yaw_rate_noise_scale,
+)
+```
 
 No end-to-end accuracy benchmark is available yet for this mechanism (the
 figures from the earlier position-blend design no longer apply, since that
@@ -549,20 +579,21 @@ track = proc.process(
 
 ## Known Limitations
 
-- **`GPSProcessor.process()` only builds `speed_noise_scale` for ABS
-  events**, not `yaw_rate_noise_scale` or `process_noise_scale`. Both
-  `GPSKalmanFilter` and `JAXKalmanFilter` support all three per-sample
-  scaling arrays (numerically matching each other — see
-  `docs/kalman_description.typ` § "JAX Backend Parity"), but the
-  processor pipeline doesn't populate the latter two yet, and no
-  benchmark exists for that combination.
 - **No automated test suite yet** (tracked above under Future Extensions);
   changes to the pipeline are currently verified manually.
-- **`EARTH_METERS_PER_DEGREE` is a single fixed constant** (111,139.0
-  m/°), not a latitude-dependent WGS84 value. This introduces a small
-  (~0.1–0.2%) systematic scale error in all ENU conversions; acceptable
-  for the flat-Earth approximation used here, but worth knowing if you
-  compare distances against a geodesic library.
+
+Resolved since the last revision of this document:
+- ~~`GPSProcessor.process()` only builds `speed_noise_scale` for ABS~~ —
+  `yaw_rate_noise_scale` and `process_noise_scale` are now exposed as
+  optional pass-through parameters on `.process()` (see "ABS Braking
+  Robustness" above). They are still not auto-derived from `abs_flag`,
+  but that is a deliberate design choice, not a gap — see the docstring
+  of `.process()` for the rationale.
+- ~~`EARTH_METERS_PER_DEGREE` is a single fixed constant~~ — coordinate
+  conversions now use `meters_per_degree_lat()`/`meters_per_degree_lon()`
+  (WGS84 ellipsoidal approximation, evaluated at each track's reference
+  latitude) throughout the codebase. `EARTH_METERS_PER_DEGREE` is kept
+  only for backward compatibility and equals the equatorial value.
 
 ## License
 

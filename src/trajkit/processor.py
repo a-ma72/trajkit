@@ -61,6 +61,8 @@ from .constants import (  # noqa: E402
     _SAVGOL_MIN_WINDOW,
     _SAVGOL_POLYORDER,
     EARTH_METERS_PER_DEGREE,
+    meters_per_degree_lat,
+    meters_per_degree_lon,
 )
 
 # ---------------------------------------------------------------------------
@@ -273,6 +275,8 @@ class GPSProcessor:
         lon_int: NDArray[np.float64] | None = None,
         lat_int: NDArray[np.float64] | None = None,
         gps_samplerate_hz: float | None = None,
+        yaw_rate_noise_scale: NDArray[np.float64] | None = None,
+        process_noise_scale: NDArray[np.float64] | None = None,
     ) -> GPSTrack:
         """Run the full GPS conditioning pipeline.
 
@@ -307,7 +311,14 @@ class GPSProcessor:
         abs_flag : NDArray[np.float64] | None, optional
             Binary ABS-active flag (1 = active). When provided alongside
             ``steering_angle_deg``, wheel speed is clamped during ABS
-            events before computing bicycle-model yaw rate.
+            events before computing bicycle-model yaw rate, and the
+            wheel-speed *measurement* noise fed to the Kalman filter is
+            automatically inflated during (and briefly around) each ABS
+            event — see "ABS Braking Robustness" in the README/
+            ``docs/kalman_description.typ``. This does not touch the yaw
+            rate or process noise; see ``yaw_rate_noise_scale`` and
+            ``process_noise_scale`` below if you need to distrust those
+            channels too, for reasons unrelated to ABS.
         lon_int : NDArray[np.float64] | None, optional
             Integer part of longitude from split-channel GPS (e.g.
             rpc3 GPS_X_Int). When provided together with ``lat_int``,
@@ -325,6 +336,28 @@ class GPSProcessor:
             frequency for the Butterworth filter cutoff.
             If None, the effective GPS Nyquist frequency is estimated
             from the detected GPS update epochs.
+        yaw_rate_noise_scale : NDArray[np.float64] | None, optional
+            Manual per-sample multiplier on the yaw-rate measurement
+            variance (``kalman``/``kalman_jax`` modes only), same length
+            as ``lon_raw``. Unlike ``abs_flag``, this is *not* derived
+            automatically — the ABS handling deliberately leaves yaw-rate
+            noise untouched (a direct sensor stays valid under tire
+            saturation, and a bicycle-model-derived rate already benefits
+            from the ABS speed interpolation). Use this when you have an
+            independent reason to distrust specific yaw-rate samples,
+            e.g. a sensor self-test flag or a known dropout window.
+        process_noise_scale : NDArray[np.float64] | None, optional
+            Manual per-sample multiplier on the full process-noise
+            covariance :math:`Q` (``kalman``/``kalman_jax`` modes only),
+            same length as ``lon_raw``. Also not derived from ``abs_flag``
+            — inflating :math:`Q` broadly during ABS would reduce trust in
+            *every* measurement rather than specifically the unreliable
+            wheel speed, which is what ``abs_flag`` already handles via
+            targeted wheel-speed noise inflation. Provided as a general
+            escape hatch for callers with a specific, well-understood
+            reason to widen the prediction uncertainty for a time window
+            (e.g. a known highly dynamic manoeuvre poorly captured by the
+            CTRV model).
 
         Returns
         -------
@@ -349,6 +382,15 @@ class GPSProcessor:
                 raise ValueError(
                     msg_0,
                 )
+
+        # Validate manual noise-scale overrides (Kalman modes only)
+        for name, arr in (
+            ("yaw_rate_noise_scale", yaw_rate_noise_scale),
+            ("process_noise_scale", process_noise_scale),
+        ):
+            if arr is not None and len(arr) != n:
+                msg_1 = f"'{name}' has length {len(arr)}, expected {n}."
+                raise ValueError(msg_1)
 
         # Step 0a: Compose coordinates from integer + fraction parts
         if lon_int is not None and lat_int is not None:
@@ -463,6 +505,8 @@ class GPSProcessor:
                 lon_filt, lat_filt, v_smooth,
                 yaw_rate_rad, update_idx, dt,
                 speed_noise_scale=speed_noise_scale,
+                yaw_rate_noise_scale=yaw_rate_noise_scale,
+                process_noise_scale=process_noise_scale,
             )
         elif "butterworth" in smoothings:
             # Butterworth low-pass (default)
@@ -547,11 +591,11 @@ class GPSProcessor:
         """
         cfg = self.g2_config if self.g2_config is not None else G2ClothoidConfig()
 
-        # Local equirectangular frame.
+        # Local equirectangular frame (WGS84 ellipsoidal meters-per-degree
+        # at the local origin latitude, see trajkit.constants).
         lon0, lat0 = lon_kalman[0], lat_kalman[0]
-        cos_lat0 = np.cos(np.radians(lat0))
-        x_m = (lon_kalman - lon0) * EARTH_METERS_PER_DEGREE * cos_lat0
-        y_m = (lat_kalman - lat0) * EARTH_METERS_PER_DEGREE
+        x_m = (lon_kalman - lon0) * meters_per_degree_lon(lat0)
+        y_m = (lat_kalman - lat0) * meters_per_degree_lat(lat0)
 
         result = G2ClothoidApproximator(cfg).fit(x_m, y_m)
         self._g2_result = result
@@ -782,9 +826,8 @@ class GPSProcessor:
 
         # ENU coordinates
         lon0, lat0 = track.longitude[0], track.latitude[0]
-        cos_lat0 = np.cos(np.radians(lat0))
-        x_m = (track.longitude - lon0) * EARTH_METERS_PER_DEGREE * cos_lat0
-        y_m = (track.latitude - lat0) * EARTH_METERS_PER_DEGREE
+        x_m = (track.longitude - lon0) * meters_per_degree_lon(lat0)
+        y_m = (track.latitude - lat0) * meters_per_degree_lat(lat0)
 
         # Arc length
         ds_step = np.sqrt(np.diff(x_m) ** 2 + np.diff(y_m) ** 2)
@@ -936,9 +979,8 @@ class GPSProcessor:
 
         # ENU coordinates
         lon0, lat0 = track.longitude[0], track.latitude[0]
-        cos_lat0 = np.cos(np.radians(lat0))
-        x_m = (track.longitude - lon0) * EARTH_METERS_PER_DEGREE * cos_lat0
-        y_m = (track.latitude - lat0) * EARTH_METERS_PER_DEGREE
+        x_m = (track.longitude - lon0) * meters_per_degree_lon(lat0)
+        y_m = (track.latitude - lat0) * meters_per_degree_lat(lat0)
 
         # Arc length
         ds_step = np.sqrt(np.diff(x_m) ** 2 + np.diff(y_m) ** 2)
@@ -1098,12 +1140,12 @@ class GPSProcessor:
         gaps = np.diff(update_idx[:-1])
         v_avg = (v_ref[update_idx[:-2]] + v_ref[update_idx[1:-1]]) / 2.0
 
-        dlat = np.diff(lat[update_idx[:-1]]) * EARTH_METERS_PER_DEGREE
-        dlon = (
-            np.diff(lon[update_idx[:-1]])
-            * EARTH_METERS_PER_DEGREE
-            * np.cos(np.radians(lat[update_idx[:-2]]))
-        )
+        # Reference latitude per segment (its start point), used for both
+        # axes' meters-per-degree — matches the array shape produced by
+        # the two np.diff() calls below (length N-2).
+        lat_ref = lat[update_idx[:-2]]
+        dlat = np.diff(lat[update_idx[:-1]]) * meters_per_degree_lat(lat_ref)
+        dlon = np.diff(lon[update_idx[:-1]]) * meters_per_degree_lon(lat_ref)
         dist = np.sqrt(dlat**2 + dlon**2)
 
         valid = v_avg > self.min_speed_calibration
@@ -1131,12 +1173,9 @@ class GPSProcessor:
         dt: float,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Derive speed from consecutive position differences."""
-        dlat = np.diff(lat) * EARTH_METERS_PER_DEGREE
-        dlon = (
-            np.diff(lon)
-            * EARTH_METERS_PER_DEGREE
-            * np.cos(np.radians(lat[:-1]))
-        )
+        lat_ref = lat[:-1]
+        dlat = np.diff(lat) * meters_per_degree_lat(lat_ref)
+        dlon = np.diff(lon) * meters_per_degree_lon(lat_ref)
         return np.sqrt(dlat**2 + dlon**2) / dt
 
     def _build_mask(
@@ -1346,9 +1385,9 @@ class GPSProcessor:
         n_epochs = len(update_idx)
 
         # Heading between epochs (from position diffs)
-        cos_lat = np.cos(np.radians(np.mean(lat[update_idx])))
-        dx_m = np.diff(lon[update_idx]) * EARTH_METERS_PER_DEGREE * cos_lat
-        dy_m = np.diff(lat[update_idx]) * EARTH_METERS_PER_DEGREE
+        lat_ref = float(np.mean(lat[update_idx]))
+        dx_m = np.diff(lon[update_idx]) * meters_per_degree_lon(lat_ref)
+        dy_m = np.diff(lat[update_idx]) * meters_per_degree_lat(lat_ref)
         heading = np.arctan2(dy_m, dx_m)
 
         # Classify transitions: 0=normal, 1=lon frozen, 2=lat frozen
