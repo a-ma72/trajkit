@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 # Defined centrally in constants.py so that clothoid.py can import
-# EARTH_METERS_PER_DEGREE without importing processor.py — importing it here
+# EARTH_METERS_PER_DEGREE without importing processor.py - importing it here
 # at module level would close an import cycle (processor -> clothoid ->
 # processor) during package initialisation.  Re-exported below for backward
 # compatibility with code that does `from trajkit.processor import
@@ -49,6 +49,10 @@ logger = logging.getLogger(__name__)
 
 from .constants import (  # noqa: E402
     _ABS_FLAG_THRESHOLD,
+    _ABS_POST_MARGIN_S,
+    _ABS_PRE_MARGIN_S,
+    _ABS_RAMP_S,
+    _ABS_SPEED_NOISE_INFLATION,
     _DS_EPS_M,
     _FREEZE_MIN_EPOCHS,
     _MS_TO_KMH,
@@ -58,7 +62,6 @@ from .constants import (  # noqa: E402
     _SAVGOL_POLYORDER,
     EARTH_METERS_PER_DEGREE,
 )
-
 
 # ---------------------------------------------------------------------------
 # Data containers
@@ -172,10 +175,12 @@ class GPSProcessor:
           (θ-continuous chain, physically consistent κ profile, no drift).
         Kalman variants require `yaw_rate_rad` or
         `steering_angle_deg` in :meth:`process`.
-    speed_smoothing_window : int, default 0
-        Savitzky-Golay window for post-smoothing the speed signal
-        derived from position differences. Only applies to the
-        Butterworth pipeline. Set 0 to disable.
+    speed_smoothing_s : float, default 0.3
+        Savitzky-Golay smoothing duration [s] for post-smoothing the
+        speed signal derived from position differences. Only applies
+        to the Butterworth pipeline. The actual window in samples is
+        computed at runtime as ``int(speed_smoothing_s * fs) | 1``,
+        ensuring rate-independent behaviour. Set 0.0 to disable.
     kalman_config : KalmanConfig or None, optional
         Tuning parameters for the Kalman filter. If None and
         smoothing='kalman', default KalmanConfig is used (dt is
@@ -196,21 +201,35 @@ class GPSProcessor:
         filter_order: int = 2,
         cutoff_factor: float = 0.5,
         min_speed_calibration: float = 1.0,
-        smoothing: Literal[
-            "butterworth", "kalman", "kalman_jax", "g2",
-        ] = "butterworth",
-        speed_smoothing_window: int = 501,
+        smoothing: str | None = "butterworth",
+        speed_smoothing_s: float = 0.3,
         kalman_config: Mapping[str, object] | None = None,
         g2_config: Mapping[str, object] | None = None,
         *,
         freeze_repair: bool = False,
     ) -> None:
+        # Check that smoothing mode is valid
+        valid_smoothings = ("butterworth", "kalman", "kalman_jax", "g2")
+        smoothings = [] if not smoothing else smoothing.split("+")
+        for s in smoothings:
+            if s not in valid_smoothings:
+                msg = (
+                    f"Invalid smoothing mode '{s}'. "
+                    f"Valid options: {valid_smoothings}."
+                )
+                raise ValueError(msg)
+        if "butterworth" in smoothings and "kalman" in smoothings:
+            msg = (
+                "Cannot combine 'butterworth' and 'kalman' smoothing. "
+                "Choose one or the other."
+            )
+            raise ValueError(msg)
         self.v_max_kmh = v_max_kmh
         self.filter_order = filter_order
         self.cutoff_factor = cutoff_factor
         self.min_speed_calibration = min_speed_calibration
         self.smoothing = smoothing
-        self.speed_smoothing_window = speed_smoothing_window
+        self.speed_smoothing_s = speed_smoothing_s
         self.kalman_config = kalman_config
         self.g2_config = g2_config
         self.freeze_repair = freeze_repair
@@ -363,8 +382,10 @@ class GPSProcessor:
 
         # Track whether yaw rate comes from a model (invalid during ABS)
         # or from a direct sensor (valid during ABS).
-        _yr_from_model = (steering_angle_deg is not None
-                          or lateral_acceleration_ms2 is not None)
+        _yr_from_model = (
+            steering_angle_deg is not None
+            or lateral_acceleration_ms2 is not None
+        )
 
         # Step 1: Detect GPS update epochs
         update_idx = self._detect_updates(lon_raw, lat_raw)
@@ -386,95 +407,69 @@ class GPSProcessor:
             dt = self._calibrate_dt(lon_raw, lat_raw, update_idx, v_reference_ms)
             fs = 1.0 / dt
 
-        # During ABS, inflate measurement noise for yaw rate (bicycle model
-        # invalid due to tire saturation) and wheel speed (interpolated
-        # v_smooth is only an approximation of true deceleration).
-        # A temporal margin + cosine ramp avoids transient kinks at the
-        # ABS flag edges (flag often lags behind actual wheel oscillation).
-        yaw_rate_noise_scale = None
+        # During ABS, the interpolated wheel speed (v_smooth) is only a
+        # rough approximation of the true, non-linear deceleration.  Rather
+        # than blending the *position* toward a model-free Butterworth
+        # filter (which discards the good GPS+yaw-rate fusion), we inflate
+        # the wheel-speed *measurement* noise so the EKF lets GPS drive the
+        # speed estimate through the ABS window.  The yaw rate comes from a
+        # direct sensor here (valid under tire saturation), so its noise is
+        # left untouched.  A cosine-ramped temporal margin avoids transient
+        # kinks at the ABS flag edges (the flag often lags the actual wheel
+        # oscillation).
         speed_noise_scale = None
-        process_noise_scale = None
-        if abs_flag is not None:
-            abs_on = abs_flag > _ABS_FLAG_THRESHOLD
-            if abs_on.any():
-                # Extend ABS mask by margin (accounts for flag delay + state recovery)
-                margin_samples = int(1.0 / dt) if dt > 0 else 500  # ~1000 ms
-                ramp_samples = int(0.1 / dt) if dt > 0 else 50    # ~100 ms ramp
-                abs_extended = abs_on.copy()
-                # Dilate: extend True regions by margin on both sides
-                indices = np.where(abs_on)[0]
-                for idx in indices:
-                    lo = max(0, idx - margin_samples)
-                    hi = min(n, idx + margin_samples + 1)
-                    abs_extended[lo:hi] = True
-
-                # Build smooth ramp (0 outside ABS → 1.0 in interior)
-                # Only ABS regions get non-zero values; rest stays at 0.
-                scale_profile = np.zeros(n)
-                abs_idx = np.where(abs_extended)[0]
-                if len(abs_idx) > 0:
-                    # Find contiguous runs and apply cosine ramp at edges
-                    diffs = np.diff(abs_idx)
-                    breaks = np.where(diffs > 1)[0]
-                    run_starts = np.concatenate([[abs_idx[0]], abs_idx[breaks + 1]])
-                    run_ends = np.concatenate([abs_idx[breaks], [abs_idx[-1]]])
-                    for rs, re in zip(run_starts, run_ends, strict=False):
-                        # Ramp up at start
-                        ramp_len = min(ramp_samples, (re - rs) // 2)
-                        if ramp_len > 0:
-                            ramp_up = 0.5 * (1 - np.cos(np.pi * np.arange(ramp_len) / ramp_len))
-                            scale_profile[rs:rs + ramp_len] = ramp_up
-                            scale_profile[rs + ramp_len:re - ramp_len + 1] = 1.0
-                            # Ramp down at end
-                            ramp_dn = 0.5 * (1 + np.cos(np.pi * np.arange(ramp_len) / ramp_len))
-                            scale_profile[re - ramp_len + 1:re + 1] = ramp_dn
-                        else:
-                            scale_profile[rs:re + 1] = 1.0
-
-                if _yr_from_model:
-                    # Bicycle model / ay-derived ω: invalid during ABS
-                    # (tire saturation). Moderate inflation — enough to
-                    # distrust the model without causing gain discontinuities.
-                    yaw_rate_noise_scale = 1.0 + 48.0 * scale_profile  # 1→49 (7× σ)
-                    speed_noise_scale = 1.0 + 3.0 * scale_profile       # 1→4  (2× σ)
-                    process_noise_scale = 1.0 + 9.0 * scale_profile     # 1→10
-                else:
-                    # Direct sensor ω (ESP): valid during ABS.
-                    # Only mild inflation for speed (v_smooth approximate)
-                    # and Q (CTRV prediction with valid ω still reasonable).
-                    yaw_rate_noise_scale = None  # sensor is trustworthy
-                    speed_noise_scale = 1.0 + 3.0 * scale_profile       # 1→4
-                    process_noise_scale = 1.0 + 9.0 * scale_profile     # 1→10
-
-
-        # Step 4: Position smoothing
-        if self.smoothing in ("kalman", "kalman_jax", "g2"):
-            lon_filt, lat_filt, speed_ms = self._apply_kalman(
-                lon_interp, lat_interp, v_smooth,
-                yaw_rate_rad, update_idx, dt,
-                yaw_rate_noise_scale=yaw_rate_noise_scale,
-                speed_noise_scale=speed_noise_scale,
-                process_noise_scale=process_noise_scale,
+        smoothings = [] if not self.smoothing else self.smoothing.split("+")
+        if abs_flag is not None and smoothings:
+            speed_noise_scale = self._build_abs_noise_scale(
+                abs_flag, dt, n,
+                inflation=_ABS_SPEED_NOISE_INFLATION,
+                pre_margin_s=_ABS_PRE_MARGIN_S,
+                post_margin_s=_ABS_POST_MARGIN_S,
+                ramp_s=_ABS_RAMP_S,
             )
 
-            # Step 4b: G2 clothoid spline (SolveG2) on Kalman output
-            if self.smoothing == "g2":
-                lon_filt, lat_filt, speed_ms = self._apply_g2(
-                    lon_filt, lat_filt, speed_ms, dt,
-                )
-
-        else:
+        # Step 4: Position smoothing
+        if any(s in ("kalman", "kalman_jax") for s in smoothings):
+            # Butterworth low-pass (default)
+            f_gps = len(update_idx) / (n * dt)
+            f_cutoff = f_gps * 0.4  # Use a lower cutoff for Kalman to avoid overshoot
+            lon_filt, lat_filt = self._lowpass(
+                lon_interp, lat_interp, f_cutoff, fs,
+            )
+            lon_filt, lat_filt, speed_ms = self._apply_kalman(
+                lon_filt, lat_filt, v_smooth,
+                yaw_rate_rad, update_idx, dt,
+                speed_noise_scale=speed_noise_scale,
+            )
+        elif "butterworth" in smoothings:
             # Butterworth low-pass (default)
             f_gps = len(update_idx) / (n * dt)
             f_cutoff = f_gps * self.cutoff_factor
             lon_filt, lat_filt = self._lowpass(
                 lon_interp, lat_interp, f_cutoff, fs,
             )
-            # Step 5: Speed — use reference (wheel speed) directly.
+            # Step 5: Speed - use reference (wheel speed) directly.
             # Position-derived speed via np.diff is inherently noisy
             # because GPS position error (~2m) / dt_update ≈ high noise.
             # Only Kalman can estimate speed properly from GPS position.
             speed_ms = np.copy(v_reference_ms)
+        else:
+            # No smoothing, no speed derivation
+            lon_filt, lat_filt = lon_interp, lat_interp
+            speed_ms = np.copy(v_reference_ms)
+
+        # Optional Savitzky-Golay post-smoothing (rate-adaptive window)
+        _sg_win = self._speed_smoothing_window(fs)
+        if _sg_win > 0 and len(speed_ms) >= _sg_win:
+            speed_ms = savgol_filter(
+                speed_ms, _sg_win, polyorder=_SAVGOL_POLYORDER,
+            )
+
+        # Step 4b: G2 clothoid spline (SolveG2) on pre-filtered output
+        if "g2" in smoothings:
+            lon_filt, lat_filt, speed_ms = self._apply_g2(
+                lon_filt, lat_filt, speed_ms, dt,
+            )
 
         # Step 6: Outlier mask
         mask = self._build_mask(speed_ms, n)
@@ -553,11 +548,13 @@ class GPSProcessor:
         figsize: tuple[float, float] = (12, 10),
         color: str = "red",
         linewidth: float = 0.8,
+        label: str | None = None,
         title: str | None = None,
         color_by: str | None = None,
         cmap: str = "coolwarm",
         clabel: str | None = None,
         percentile_clip: float = 99.0,
+        fig: plt.Figure | None = None,
         *,
         basemap: bool = True,
         symmetric_cmap: bool = True,
@@ -578,6 +575,8 @@ class GPSProcessor:
             Line color (ignored when ``color_by`` is set).
         linewidth : float, default 0.8
             Line width.
+        label : str or None
+            Legend label. If None, no legend is shown.
         title : str or None
             Custom title. If None, auto-generated.
         color_by : str or None
@@ -587,6 +586,8 @@ class GPSProcessor:
             Matplotlib colormap name (used with ``color_by``).
         clabel : str or None
             Colorbar label. Auto-generated if None.
+        fig : matplotlib.figure.Figure or None
+            If provided, plot into this figure instead of creating a new one.
         symmetric_cmap : bool, default True
             If True, center the colormap at zero.
         percentile_clip : float, default 99.0
@@ -598,7 +599,12 @@ class GPSProcessor:
             The created figure.
 
         """
-        fig, ax = plt.subplots(figsize=figsize)
+        if fig is None:
+            fig_provided = False
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig_provided = True
+            ax = fig.gca()
         mask = track.mask
         lon = track.longitude[mask]
         lat = track.latitude[mask]
@@ -627,15 +633,15 @@ class GPSProcessor:
                 vmax = np.percentile(c_data, percentile_clip)
                 norm = Normalize(vmin=vmin, vmax=vmax)
 
-            lc = LineCollection(segments, cmap=cmap, norm=norm, linewidth=linewidth)
+            lc = LineCollection(segments, cmap=cmap, norm=norm, linewidth=linewidth, label=label)
             lc.set_array(c_data)
             ax.add_collection(lc)
             ax.autoscale()
             fig.colorbar(lc, ax=ax, label=_clabel)
         else:
-            ax.plot(lon, lat, color=color, linewidth=linewidth)
+            ax.plot(lon, lat, color=color, linewidth=linewidth, label=label)
 
-        if basemap:
+        if basemap and not fig_provided:
             try:
                 cx.add_basemap(
                     ax,
@@ -646,11 +652,12 @@ class GPSProcessor:
             except Exception as exc:
                 logger.warning("Basemap could not be loaded: %s", exc)
 
-        _title = title or (
-            f"GPS Track — {track.n_valid:,} valid / {track.n_samples:,} samples "
-            f"({track.fs:.0f} Hz)"
-        )
-        ax.set_title(_title)
+        if not fig_provided:
+            _title = title or (
+                f"GPS Track - {track.n_valid:,} valid / {track.n_samples:,} samples "
+                f"({track.fs:.0f} Hz)"
+            )
+            ax.set_title(_title)
         ax.set_xlabel("Longitude [°]")
         ax.set_ylabel("Latitude [°]")
 
@@ -1011,6 +1018,18 @@ class GPSProcessor:
     # Private methods
     # ------------------------------------------------------------------
 
+    def _speed_smoothing_window(self, fs: float) -> int:
+        """Compute Savitzky-Golay window size from duration and sample rate.
+
+        Returns an odd integer >= _SAVGOL_MIN_WINDOW, or 0 if smoothing
+        is disabled (speed_smoothing_s == 0).
+        """
+        if self.speed_smoothing_s <= 0.0:
+            return 0
+        win = int(self.speed_smoothing_s * fs)
+        win = win | 1  # ensure odd
+        return max(win, _SAVGOL_MIN_WINDOW)
+
     @staticmethod
     def _detect_updates(
         lon: NDArray[np.float64],
@@ -1111,6 +1130,86 @@ class GPSProcessor:
         return speed_ms < v_threshold
 
     @staticmethod
+    def _build_abs_noise_scale(
+        abs_flag: NDArray[np.float64],
+        dt: float,
+        n: int,
+        inflation: float,
+        pre_margin_s: float,
+        post_margin_s: float,
+        ramp_s: float,
+    ) -> NDArray[np.float64]:
+        """Build a per-sample measurement-noise scale array for ABS events.
+
+        Returns an array of multipliers (1.0 outside ABS, up to
+        ``inflation`` inside) that inflate a Kalman measurement-noise
+        variance during ABS intervention.  A fixed temporal margin
+        before and after each ABS run covers the flag-vs-signal lag,
+        and a raised-cosine ramp on both edges avoids a step change in
+        trust that would otherwise inject a kink into the estimate.
+
+        Parameters
+        ----------
+        abs_flag : NDArray[np.float64]
+            Binary ABS-active flag (values above the decision threshold
+            are treated as active), shape (n,).
+        dt : float
+            Calibrated sampling period [s].
+        n : int
+            Number of samples (length of the position arrays).
+        inflation : float
+            Peak noise multiplier applied in the fully-active region.
+        pre_margin_s, post_margin_s : float
+            Temporal margins [s] added before / after each ABS run.
+        ramp_s : float
+            Raised-cosine ramp length [s] on each edge of the window.
+
+        Returns
+        -------
+        scale : NDArray[np.float64]
+            Per-sample noise scale in [1.0, inflation], shape (n,).
+
+        """
+        scale = np.ones(n, dtype=np.float64)
+        abs_on = abs_flag > _ABS_FLAG_THRESHOLD
+        if not abs_on.any() or dt <= 0.0:
+            return scale
+
+        pre = int(pre_margin_s / dt)
+        post = int(post_margin_s / dt)
+        ramp = max(int(ramp_s / dt), 1)
+
+        # Dilate the ABS mask by the temporal margins.
+        window = abs_on.copy()
+        starts = np.where(np.diff(abs_on.astype(np.int8)) == 1)[0] + 1
+        ends = np.where(np.diff(abs_on.astype(np.int8)) == -1)[0] + 1
+        if abs_on[0]:
+            starts = np.concatenate([[0], starts])
+        if abs_on[-1]:
+            ends = np.concatenate([ends, [n]])
+        for s0, e0 in zip(starts, ends, strict=False):
+            window[max(0, s0 - pre):min(n, e0 + post)] = True
+
+        # Raised-cosine ramp on each contiguous window edge.
+        target = 1.0 + (inflation - 1.0) * window.astype(np.float64)
+        w_idx = np.where(window)[0]
+        if len(w_idx) == 0:
+            return scale
+        breaks = np.where(np.diff(w_idx) > 1)[0]
+        run_starts = np.concatenate([[w_idx[0]], w_idx[breaks + 1]])
+        run_ends = np.concatenate([w_idx[breaks], [w_idx[-1]]])
+        for rs, re in zip(run_starts, run_ends, strict=False):
+            ramp_len = min(ramp, (re - rs) // 2)
+            if ramp_len <= 0:
+                continue
+            up = 0.5 * (1.0 - np.cos(np.pi * np.arange(ramp_len) / ramp_len))
+            target[rs:rs + ramp_len] = 1.0 + (inflation - 1.0) * up
+            dn = 0.5 * (1.0 + np.cos(np.pi * np.arange(ramp_len) / ramp_len))
+            target[re - ramp_len + 1:re + 1] = 1.0 + (inflation - 1.0) * dn
+
+        return target
+
+    @staticmethod
     def _clamp_speed_during_abs(
         v_ms: NDArray[np.float64],
         abs_active: NDArray[np.float64],
@@ -1149,7 +1248,7 @@ class GPSProcessor:
         valid_idx = np.where(~abs_on)[0]
 
         if len(valid_idx) == 0:
-            # Entire signal is ABS — nothing to interpolate from
+            # Entire signal is ABS - nothing to interpolate from
             return v_out
 
         # Linear interpolation: use non-ABS samples as anchors,
@@ -1274,7 +1373,7 @@ class GPSProcessor:
 
             # === Repair: interpolate frozen coordinate ===
             # Replace frozen values with linear bridge between anchors.
-            # Keep normal noise (full gain) — the interpolated value is
+            # Keep normal noise (full gain) - the interpolated value is
             # smooth and provides continuous position anchoring.
             idx_before = update_idx[run_start - 1] if run_start > 0 else update_idx[0]
             idx_after = update_idx[min(run_end, n_epochs - 1)]
@@ -1310,8 +1409,8 @@ class GPSProcessor:
         yaw_rate_rad: NDArray[np.float64] | None,
         update_idx: NDArray[np.intp],
         dt: float,
-        yaw_rate_noise_scale: NDArray[np.float64] | None = None,
         speed_noise_scale: NDArray[np.float64] | None = None,
+        yaw_rate_noise_scale: NDArray[np.float64] | None = None,
         process_noise_scale: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
         """Apply Kalman EKF + RTS smoother for position conditioning.
@@ -1409,8 +1508,8 @@ class GPSProcessor:
             v_reference_ms=v_reference_ms,
             yaw_rate_rad=yaw_rate_rad,
             gps_update_mask=gps_update_mask,
-            yaw_rate_noise_scale=yaw_rate_noise_scale,
             speed_noise_scale=speed_noise_scale,
+            yaw_rate_noise_scale=yaw_rate_noise_scale,
             process_noise_scale=process_noise_scale,
         )
 

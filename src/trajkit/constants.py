@@ -130,6 +130,28 @@ _ABS_FLAG_THRESHOLD: float = 0.5
 """Decision threshold for the binary ABS-active flag (stored as 0.0/1.0).
 Values above this are treated as ABS active."""
 
+_ABS_SPEED_NOISE_INFLATION: float = 400.0
+"""Peak multiplier applied to the wheel-speed measurement variance during
+ABS intervention.  The interpolated wheel speed is an unreliable proxy for
+the true non-linear deceleration, so its variance is inflated (≈20x in std)
+and the EKF lets GPS drive the speed estimate through the ABS window.
+Applied as a variance scale; std inflation is sqrt of this value."""
+
+_ABS_PRE_MARGIN_S: float = 0.3
+"""Temporal margin [s] added before each ABS run when building the
+speed-noise scale.  Covers the lag between actual wheel oscillation onset
+and the ABS flag rising edge."""
+
+_ABS_POST_MARGIN_S: float = 0.5
+"""Temporal margin [s] added after each ABS run.  Covers residual wheel
+oscillation after the flag falling edge before wheel speed is trustworthy
+again."""
+
+_ABS_RAMP_S: float = 0.15
+"""Raised-cosine ramp length [s] on each edge of the ABS noise-scale
+window.  Avoids a step change in measurement trust that would inject a
+kink into the Kalman estimate."""
+
 _FREEZE_MIN_EPOCHS: int = 3
 """Minimum number of GPS update epochs required by _repair_gps_freezes.
 

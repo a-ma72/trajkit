@@ -47,7 +47,7 @@ class KalmanConfig:
         GPS position measurement noise std [m].
     sigma_v_wheel : float, default 0.1
         Wheel speed measurement noise std [m/s].
-    sigma_yaw_rate : float, default 0.02
+    sigma_yaw_rate : float, default 0.2
         Yaw rate measurement noise std [rad/s].
     sigma_a : float, default 2.0
         Process noise for longitudinal acceleration [m/s^2].
@@ -86,7 +86,7 @@ class KalmanConfig:
     dt: float
     sigma_pos_gps: float = 2.0
     sigma_v_wheel: float = 0.1
-    sigma_yaw_rate: float = 0.02
+    sigma_yaw_rate: float = 0.2
     sigma_a: float = 2.0
     sigma_yaw_acc: float = 0.5
     sigma_pos_drift: float = 5.0
