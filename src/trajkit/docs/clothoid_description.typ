@@ -411,67 +411,82 @@ before B-spline fitting. Four steps are required for correct `SolveG2` behaviour
 
 ```
 clothoid.py
-├── ClothoidConfig          (dataclass: tuning parameters)
-├── ClothoidResult          (dataclass: output container)
-├── ClothoidSegment         (dataclass: per-segment parameters)
-│   ├── smooth()            → ClothoidResult
-│   ├── _segment_curvature()    (breakpoint detection)
-│   ├── _fit_segments()         (independent LS per segment)
-│   └── _build_curvature_profile()     (full-resolution κ)
-│   ├── evaluate()          → (s, x, y, θ, κ)
-│   ├── curvature_at(s)     → κ (piecewise linear)
-│   ├── dkappa_ds(s)        → σ (piecewise constant)
-│   ├── position_at(s)      → (x, y)
-│   ├── support_vector()    → (u, k) analysis only
-│   └── support_vector_dual() → (u, k) with jumps
-├── G2ClothoidApproximator  (greedy knot placement, Bertolazzi-Frego SolveG2)
+├── gps_enu()                  (WGS84 ↔ ENU, forward/inverse in one function)
+├── ClothoidSegment            (dataclass: x0, y0, theta0, kappa0, sigma, length)
+├── G2ClothoidConfig           (dataclass: tuning parameters)
+├── G2ClothoidFitResult        (dataclass: output container)
+│   └── resample(spacing_m)    → dict(x, y, kappa, s)
+└── G2ClothoidApproximator     (greedy knot placement, Bertolazzi-Frego SolveG2)
+    ├── fit(x_m, y_m)               → G2ClothoidFitResult
+    ├── _smooth_and_parametrize()   (spline smoothing, chord-length resampling,
+    │                                analytic κ, θ = θ0 + ∫κ ds)
+    ├── _interval_segs()            (SolveG2 call for one candidate interval)
+    ├── _interval_error()           (nearest-neighbour lateral error vs. reference)
+    ├── _greedy_knots()             (exponential search + bisection over knots)
+    └── _build_result()             (final chain, error statistics,
+                                      G1-Hermite fallback for failed intervals)
 ```
+
+#block(fill: luma(240), inset: 8pt, radius: 3pt)[
+  *Note*: an earlier version of this module additionally exposed a
+  `ClothoidConfig`/`ClothoidResult` pair built around a segment-wise
+  least-squares fitter (with a `smooth()` entry point and methods such as
+  `curvature_at()`, `position_at()`, `support_vector()`). That API has
+  been removed; `G2ClothoidApproximator` is now the only fitting path in
+  `clothoid.py`. Any references to the older classes elsewhere (code
+  comments, notebooks) are stale.
+]
 
 == Data Flow
 
-
+#align(center)[
+  #box(stroke: 0.5pt, inset: 10pt, radius: 4pt)[
+    #set text(size: 9pt)
+    #grid(
+      columns: 1,
+      row-gutter: 6pt,
+      [*Input*: `(x_m, y_m)` — local ENU positions, typically from the Kalman track],
+      [#h(2em) ↓ `_smooth_and_parametrize()`: dedup → chord-length param. →
+        quintic B-spline → resample to uniform arc length → analytic κ →
+        moving-average smoothing → θ = θ0 + ∫κ ds],
+      [*Reference grid*: `(xs, ys, s_uni, theta, kappa)`, uniform in arc length],
+      [#h(2em) ↓ `_greedy_knots()`: exponential forward search + bisection,
+        each candidate interval checked via `_interval_segs()` +
+        `_interval_error()`],
+      [*Support points*: `knot_idx` — minimal set meeting `position_tolerance_m`],
+      [#h(2em) ↓ `_build_result()`: `SolveG2` per interval (G1-Hermite
+        fallback if it fails), dense re-sampling for error statistics],
+      [*Output*: `G2ClothoidFitResult` — segments, knot indices, error
+        statistics],
+    )
+  ]
+]
 
 = Practical Considerations
 
-== Low-Speed Pathology
+== Curvature Denominator Guard at Low Parametric Speed
 
-At vehicle speeds below ~20 km/h, GPS positions cluster and heading
-becomes unreliable. The clothoid fitter produces extreme curvatures
-(|$kappa$| > 1 rad/m, corresponding to turn radii < 1 m) for these
-segments.
+The analytic curvature formula
+$kappa = (x' y'' - y' x'') / (x'^2 + y'^2)^(3 slash 2)$ divides by the
+squared parametric speed $x'^2 + y'^2$. Where consecutive resampled points
+are (near-)co-located — e.g. GPS clustering at very low vehicle speed, or
+residual duplicates the deduplication step missed — this denominator
+approaches zero. `_smooth_and_parametrize()` floors it at `_SPEED_SQ_MIN`
+($10^(-12)$ m²/param²) before the division, which prevents `inf`/`NaN`
+curvature values but does not itself produce a physically meaningful
+curvature for genuinely stationary segments; the resulting near-zero
+speed also means such segments contribute negligible arc length to the
+downstream chain. `dedup_threshold_m` (default $10^(-3)$ m) removes the
+most common source of exact duplicates upstream, before this guard is
+ever reached.
 
-*Mitigation*: The heading-matched initialization uses reference heading
-changes $Delta theta_"ref"$ from the downsampled Kalman trajectory,
-which is already smoothed. This avoids pathological $kappa$ values from
-noisy local position clusters. For truly stationary segments, $kappa_0$
-will be near zero (minimal heading change over zero distance → undefined,
-but length is also zero → segment contributes nothing to the chain).
+== Performance
 
-== Computation Cost
-
-The dominant cost is the per-segment least-squares optimization.
-Typical timings for a 4 km track (200k input samples):
-
-- Downsampling + segmentation: < 10 ms
-- ~200 segment fits (Levenberg–Marquardt): ~70 ms
-- Heading-matched $theta$-chain: ~5 ms (single forward pass, no optimization)
-- Full-resolution expansion: ~5 ms
-- *Total*: ~90 ms (added to the 4.1 s Kalman runtime)
-
-The `G2ClothoidApproximator` adds ~0.6--3 s for full-track
-approximation with max error $<$ 0.5 m.
-
-== Use Cases for Each Class
-
-#figure(
-  table(
-    columns: 2,
-    align: (left, left),
-    table.header[Need][Use],
-    [G2-continuous arc chain (compact, all tolerances met)], [`G2ClothoidApproximator` + `G2ClothoidConfig`],
-  ),
-  caption: [Choosing the right tool for the task.],
-) <tab-usage>
+See @tab-g2-results for measured end-to-end runtimes of
+`G2ClothoidApproximator.fit()`. As a rule of thumb, the dominant cost is
+the greedy search's repeated `SolveG2` + nearest-neighbour error
+evaluation, which scales as $O(N log N)$ in support points (§ "Why
+SolveG2 Fits This Application Particularly Well").
 
 = Summary
 
@@ -482,10 +497,15 @@ and curvature are continuous at every joint. The greedy forward search
 guarantees max lateral error $<=$ `position_tolerance_m` (default 0.5 m)
 with no rubber-band correction or post-processing required.
 
-
-The critical distinction between these two: fitted $kappa$ serves
-*analysis* (derivatives, segment structure); geometric $kappa$ serves
-*reconstruction* (position recovery from support points).
+Two curvature representations appear in this pipeline and serve different
+purposes: the smoothed *reference* curvature $kappa(s)$ produced by
+`_smooth_and_parametrize()` drives segmentation and supplies the boundary
+conditions passed to `SolveG2` — it is the basis for *analysis* (where to
+place knots, what curvature the chain must match at each support point).
+Each resulting arc's own affine law $kappa_0 + sigma dot s$, stored in its
+`ClothoidSegment` and evaluated through `pyclothoids` via Fresnel
+integrals, is the *geometric* representation used for position
+reconstruction (`resample()`, error evaluation against the reference).
 
 #pagebreak()
 

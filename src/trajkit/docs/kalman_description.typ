@@ -193,7 +193,23 @@ noise must scale with $Delta t$ (not $Delta t^4$) to maintain GPS
 observability. The critical parameter is the number of prediction steps
 between GPS fixes: $N = f_s slash f_"GPS"$.
 
-= Measurement Updates
+= Position Pre-Filtering <pre-filtering>
+
+Before the interpolated GPS positions reach `GPSKalmanFilter.run()`,
+`GPSProcessor.process()` applies a zero-phase Butterworth low-pass
+(`filtfilt`, order `filter_order`, default 2) to `lon_interp`/`lat_interp`.
+The cutoff is set below the GPS update rate,
+
+$ f_"cutoff" = 0.4 dot f_"GPS", quad f_"GPS" = N_"updates" slash (n dot Delta t), $
+
+i.e. a lower fraction than the `cutoff_factor` used for the pure
+Butterworth pipeline (default 0.5), to avoid overshoot feeding into the
+EKF. This pre-filtering step is not part of the mathematical filter
+description above — it changes the effective input noise seen by the GPS
+measurement update relative to a raw, merely S&H-interpolated signal, and
+should be kept in mind when tuning `sigma_pos_gps`.
+
+= Measurement Updates <measurement-updates>
 
 The filter processes three measurement types at each time step, applied
 sequentially (scalar updates for efficiency):
@@ -295,8 +311,12 @@ local tangent-plane approximation:
 $ x_"ENU" = ("lon" - "lon"_0) dot M_"earth" dot cos("lat"_0) $
 $ y_"ENU" = ("lat" - "lat"_0) dot M_"earth" $
 
-where $M_"earth" = 111 space 319.49$ m/° is the meters-per-degree
-constant on the WGS84 ellipsoid. The inverse conversion is applied
+where $M_"earth" = 111 space 139.0$ m/° is the meters-per-degree
+constant used throughout trajkit (`EARTH_METERS_PER_DEGREE` in
+`constants.py`). This is a fixed approximation rather than a
+latitude-dependent WGS84 value (the exact meters-per-degree of
+latitude varies from about 110,574 m at the equator to 111,694 m at
+the poles); the inverse conversion is applied
 to produce the final output in geographic coordinates.
 
 This flat-Earth approximation introduces negligible error for
@@ -343,6 +363,29 @@ The `run()` method performs:
 3. Forward EKF + optional RTS (via `_ekf_forward_rts`)
 4. Inverse coordinate conversion (ENU → WGS84)
 
+== JAX Backend Parity <jax-parity>
+
+`jax_kalman.py` provides `JAXKalmanFilter` as an XLA/GPU-capable
+alternative (`smoothing='kalman_jax'`), sharing the same `KalmanConfig`
+and `KalmanResult` types. It is *not* currently numerically equivalent to
+`GPSKalmanFilter`:
+
+- *No position-drift fix*: the JAX process-noise matrix $bold(Q)$ omits
+  the $sigma_"drift"^2 dot Delta t$ term from @drift-fix. At high sample
+  rates with sparse GPS this reintroduces the dead-reckoning drift that
+  @drift-fix exists to prevent.
+- *No speed-dependent GPS noise*: the JAX measurement covariance
+  $bold(R)_"GPS"$ is the constant $sigma_"pos,GPS"^2 dot bold(I)_2$;
+  `gps_low_speed_gain` and `gps_low_speed_v_scale` are accepted by
+  `KalmanConfig` but have no effect on the JAX path, so the standstill
+  multipath suppression described under @tab-dynamic-gps does not apply.
+- *No ABS noise-scale hooks*: `JAXKalmanFilter.run()` does not accept
+  `speed_noise_scale` / `yaw_rate_noise_scale` / `process_noise_scale`.
+
+Until these are ported, prefer the Numba backend (`smoothing='kalman'`)
+for tracks with high sample rates, sparse GPS, standstill segments, or
+ABS events — i.e. the scenarios this document is mostly about.
+
 = Tuning Parameters <tuning>
 
 #figure(
@@ -352,7 +395,7 @@ The `run()` method performs:
     table.header[Parameter][Default][Effect of increasing],
     [$sigma_"pos,GPS"$], [2.0 m], [Less trust in GPS → smoother path],
     [$sigma_"v,wheel"$], [0.1 m/s], [Less trust in wheel speed → follows GPS-derived speed],
-    [$sigma_omega$], [0.02 rad/s], [Less trust in gyro → heading follows GPS],
+    [$sigma_omega$], [0.2 rad/s], [Less trust in gyro → heading follows GPS],
     [$sigma_a$], [2.0 m/s²], [Allows faster speed changes → better acceleration tracking],
     [$sigma_(dot(omega))$], [0.5 rad/s²], [Allows faster yaw changes → better cornering],
     [$sigma_"drift"$], [5.0 m/$sqrt(s)$], [Stronger GPS pull → prevents dead-reckoning drift],
@@ -442,7 +485,7 @@ Without treatment, three mechanisms corrupt the EKF:
 
 + *Bicycle-model yaw rate is invalid*: $omega = v dot tan(delta) slash L$
   uses oscillating $v$, producing error/$sigma$ ratios of $approx 3.5 times$.
-  With $sigma_omega = 0.02$ rad/s, the filter trusts the corrupted $omega$
+  With $sigma_omega = 0.2$ rad/s, the filter trusts the corrupted $omega$
   and heading drifts up to 8° over a 2 s ABS event.
 
 + *Wheel speed is unreliable*: The raw signal swings $plus.minus 10$ km/h
@@ -450,6 +493,14 @@ Without treatment, three mechanisms corrupt the EKF:
 
 + *CTRV prediction is wrong*: With invalid $omega$ and $v$, position error
   accumulates $approx 0.28$ m per prediction epoch between GPS corrections.
+
+The implementation addresses these with two independent mechanisms: a
+speed-interpolation stage that runs unconditionally when `abs_flag` is
+provided, and a per-sample measurement-noise inflation that the EKF applies
+during the update step. An earlier design additionally crossfaded the
+*position* output toward a model-free Butterworth track during ABS events;
+that position-blend stage was dropped in favour of the noise-inflation
+approach below and is no longer part of the pipeline.
 
 == Stage 1: Speed Interpolation
 
@@ -467,62 +518,78 @@ trend (offline processing knows both anchor points). The interpolated
 $v_"smooth"$ is used for both the bicycle-model yaw rate computation
 and as the Kalman speed measurement input.
 
-== Stage 2: Butterworth Position Blend
+== Stage 2: Wheel-Speed Measurement-Noise Inflation
 
-Rather than inflating Kalman noise parameters (complex,
-tuning-sensitive, prone to RTS backward-propagation artifacts), the
-*position* is crossfaded from the Kalman track to a Butterworth-filtered
-GPS track during ABS events.  The BW filter is model-free (no bicycle
-model, no yaw rate) and therefore completely unaffected by ABS.
+Rather than crossfading the *position* toward a model-free filter, the
+implementation keeps the full GPS + wheel-speed + yaw-rate fusion active
+throughout the ABS event and instead tells the EKF to distrust the
+interpolated wheel speed while it lasts. `_build_abs_noise_scale()`
+produces a per-sample multiplier $s_v [k] in [1, s_"max"]$ that scales the
+wheel-speed measurement variance $R_v [k] = sigma_(v,"wheel")^2 dot s_v [k]$
+(see @tab-tuning and the $R_v$ definition in @measurement-updates). With the
+measurement variance inflated, the Kalman gain for the speed update drops
+toward zero and the EKF lets GPS position updates and the CTRV model carry
+the speed estimate through the ABS window instead.
 
-After the EKF+RTS produces its full trajectory, a parallel Butterworth
-lowpass (`filtfilt`, 2nd order, 7 Hz cutoff) is applied to the same
-interpolated GPS data.  A blend mask $alpha in [0, 1]$ selects pure
-Kalman ($alpha = 0$) during normal driving and pure BW ($alpha = 1$)
-during ABS:
+The yaw rate is left untouched: when it comes from a direct sensor it
+remains valid under tire saturation, and the bicycle-model-derived yaw rate
+already benefits from $v_"smooth"$ in Stage 1.
 
-$ "lon"_"out" = (1 - alpha) dot "lon"_"kalman" + alpha dot "lon"_"bw" $
-$ "lat"_"out" = (1 - alpha) dot "lat"_"kalman" + alpha dot "lat"_"bw" $
+*Temporal margin*: because the ABS flag typically lags the actual wheel
+oscillation, the inflated-noise window is dilated by a fixed margin before
+and after each contiguous ABS run:
 
-Speed remains from the Kalman state (uses $v_"smooth"$, correctly tracks
-deceleration).
+- *Pre-ABS margin*: `_ABS_PRE_MARGIN_S` (default 0.3 s)
+- *Post-ABS margin*: `_ABS_POST_MARGIN_S` (default 0.5 s)
 
-*Asymmetric temporal margin*:
-- _Pre-ABS (1000 ms)_: The ABS flag lags behind actual tire saturation
-  by 200--700 ms.  The 1 s pre-margin covers the pre-onset transient.
-- _Post-ABS (speed-based)_: The blend stays active until the vehicle
-  resumes driving ($v > 2$ m/s), minimum 2000 ms, maximum 10 s timeout.
-  This avoids the Kalman heading-drift artifact at standstill.
+*Raised-cosine ramp*: each window edge is smoothed over
+`_ABS_RAMP_S` (default 0.15 s) with a half-wave cosine,
 
-*State-injection at re-entry*: A 500 ms cosine-decaying offset
-correction stitches the Kalman trajectory to the BW exit position,
-eliminating any residual position jump when the blend fades back.
+$ s_v (t) = 1 + (s_"max" - 1) dot 1/2 (1 - cos(pi dot t slash t_"ramp")), $
 
-*Cosine ramp (150 ms)*: Blend transitions smoothly:
+avoiding a step change in measurement trust that would otherwise inject a
+kink into the estimate.
 
-$ alpha(t) = 1/2 (1 - cos(pi dot t slash t_"ramp")) $
+*Peak inflation*: `_ABS_SPEED_NOISE_INFLATION` defaults to 400 (variance
+scale), i.e. a $20 times$ inflation of $sigma_(v,"wheel")$.
 
-This avoids position discontinuities at the Kalman/BW boundary.
+*Advantages of noise inflation over a position blend*:
+- No separate model-free filter branch, no blend mask, no state-injection
+  logic at re-entry — the EKF's own covariance propagation handles the
+  transition.
+- The full sensor fusion (GPS + yaw rate) stays active during ABS instead
+  of temporarily disabling it in favour of a position-only filter.
+- Simpler to reason about: a single scalar multiplier on one measurement
+  channel, versus a parallel filter, a crossfade schedule, and a
+  re-entry correction.
+
+*Current scope*: only the wheel-speed channel is inflated by the processor
+pipeline today. The EKF (`_ekf_forward_rts`) also accepts per-sample scale
+arrays for the yaw-rate measurement noise and for the process noise $Q$
+(`yaw_rate_noise_scale`, `process_noise_scale` in
+`GPSKalmanFilter.run()`), but `GPSProcessor.process()` does not currently
+populate them — they are available for callers who need finer control but
+are not exercised by the default ABS handling.
 
 #figure(
   table(
     columns: 2,
     align: (left, right),
-    table.header[Metric][Value],
-    [Max |Kalman \u2212 BW| during ABS], [4.8 cm],
-    [Mean |Kalman \u2212 BW| during ABS], [1.8 cm],
-    [Speed tracking during ABS], [smooth deceleration, no oscillation],
-    [Normal driving accuracy], [unchanged (full sensor fusion)],
+    table.header[Parameter][Default],
+    [`_ABS_FLAG_THRESHOLD`], [0.5],
+    [`_ABS_SPEED_NOISE_INFLATION`], [400.0 (variance, ≈20× in σ)],
+    [`_ABS_PRE_MARGIN_S`], [0.3 s],
+    [`_ABS_POST_MARGIN_S`], [0.5 s],
+    [`_ABS_RAMP_S`], [0.15 s],
   ),
-  caption: [ABS handling performance (steering-angle model, full stops from 46--56 km/h).],
-) <tab-abs-results>
+  caption: [ABS noise-inflation constants (`constants.py`).],
+) <tab-abs-constants>
 
-*Advantages over noise inflation*:
-- No tuning parameters ($sigma_omega$, $sigma_v$, $Q$ scales) needed
-- No RTS backward-propagation artifacts
-- 19\u00d7 better position accuracy during ABS (90 cm \u2192 5 cm)
-- Simpler code (\~30 lines vs \~60 lines)
-
+No end-to-end accuracy benchmark for this mechanism is available yet;
+@tab-abs-constants documents the current parameters rather than measured
+performance. A benchmark analogous to the earlier position-blend study
+(full stops with a steering-angle-derived yaw rate) would be a useful
+follow-up.
 
 = GPS Freeze Repair (Preprocessing) <freeze-repair>
 
@@ -635,6 +702,18 @@ def _repair_gps_freezes(
 Called inside `GPSProcessor._apply_kalman()` after S&H interpolation
 and update detection, before building the GPS mask and calling
 `GPSKalmanFilter.run()`.
+
+#block(
+  fill: luma(240), inset: 8pt, radius: 3pt,
+)[
+  *Note on the in-code docstring*: the current docstring of
+  `_repair_gps_freezes()` describes a noise-inflation / partial 1D
+  measurement update — the approach this section just showed to perform
+  *worse* (see @tab-repair-comparison). That description does not match
+  the function body, which performs the linear-interpolation repair
+  documented above. Treat this document as authoritative; the docstring
+  should be corrected to match the implementation.
+]
 
 = Summary
 
