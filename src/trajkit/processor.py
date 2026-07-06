@@ -224,6 +224,29 @@ class GPSProcessor:
                 "Choose one or the other."
             )
             raise ValueError(msg)
+
+        # 'g2' fits a clothoid chain to the Kalman-filtered trajectory (see
+        # docs/clothoid_description.typ and the README "Smoothing Modes"
+        # table). Without an explicit Kalman/Kalman-JAX (or Butterworth)
+        # position-smoothing stage there would be nothing to fit the
+        # clothoids to but raw, S&H-interpolated GPS - silently degrading
+        # accuracy instead of following the documented pipeline. Auto-add
+        # 'kalman' so bare 'g2' behaves as documented, and log it so the
+        # substitution is visible rather than silent. An explicitly chosen
+        # position-smoothing backend (kalman, kalman_jax, or butterworth)
+        # is left untouched.
+        if "g2" in smoothings and not any(
+            s in ("kalman", "kalman_jax", "butterworth") for s in smoothings
+        ):
+            logger.info(
+                "smoothing=%r implies Kalman pre-filtering for the clothoid "
+                "fit; using 'kalman+g2'. Pass smoothing='kalman+g2' "
+                "(or 'kalman_jax+g2') explicitly to silence this message.",
+                smoothing,
+            )
+            smoothing = "+".join(["kalman", *smoothings])
+            smoothings = smoothing.split("+")
+
         self.v_max_kmh = v_max_kmh
         self.filter_order = filter_order
         self.cutoff_factor = cutoff_factor
@@ -1267,14 +1290,25 @@ class GPSProcessor:
         min_run_length: int = 3,
         min_expected_change_m: float = 5.0,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Detect single-axis GPS freezes and build per-axis noise array.
+        """Detect single-axis GPS freezes and repair by linear interpolation.
 
-        Instead of removing freeze epochs or interpolating coordinates,
-        this method returns a per-sample noise array that inflates the
-        measurement variance for the frozen axis to effectively infinity.
-        The Kalman filter then performs a true partial 1D measurement
-        update: correcting from the valid axis while ignoring the
-        frozen axis (Kalman gain → 0 for that axis).
+        Some GPS receivers intermittently freeze a single coordinate axis
+        (e.g. longitude stays constant for several fixes while latitude
+        keeps updating). Left uncorrected, the EKF partially tracks the
+        frozen axis, producing a heading kink once the freeze ends that the
+        RTS smoother then propagates globally.
+
+        This method replaces the frozen-axis values with a linear
+        interpolation between the last valid fix before the freeze and the
+        first valid fix after it; the non-frozen axis is left unchanged and
+        both axes keep their normal (non-inflated) measurement noise once
+        fed into the EKF. An alternative approach — inflating the
+        measurement variance for the frozen axis instead of interpolating
+        it, so the Kalman gain for that axis drops toward zero (a partial
+        1D measurement update) — was evaluated and performs measurably
+        worse on tight curves (see ``docs/kalman_description.typ`` §
+        "Why Not Partial (1D) Measurement Updates?"); it is not what this
+        function does.
 
         Detection uses an innovation-based criterion: a coordinate is
         frozen only if (a) it didn't change for ``min_run_length``
@@ -1502,15 +1536,41 @@ class GPSProcessor:
             cfg = KalmanConfig(dt=dt)
 
         kf = _FilterCls(cfg)
-        result = kf.run(
-            longitude=lon_interp,
-            latitude=lat_interp,
-            v_reference_ms=v_reference_ms,
-            yaw_rate_rad=yaw_rate_rad,
-            gps_update_mask=gps_update_mask,
-            speed_noise_scale=speed_noise_scale,
-            yaw_rate_noise_scale=yaw_rate_noise_scale,
-            process_noise_scale=process_noise_scale,
-        )
+
+        if self.smoothing == "kalman_jax":
+            # JAXKalmanFilter.run() does not (yet) accept per-sample
+            # measurement/process-noise scaling — see
+            # docs/kalman_description.typ § "JAX Backend Parity". Passing
+            # these kwargs through unconditionally would raise a TypeError,
+            # so they are dropped here; warn if the caller actually asked
+            # for ABS-style scaling so the silent accuracy loss is visible.
+            if any(
+                arr is not None
+                for arr in (speed_noise_scale, yaw_rate_noise_scale, process_noise_scale)
+            ):
+                logger.warning(
+                    "smoothing='kalman_jax' does not support per-sample "
+                    "measurement/process-noise scaling (e.g. ABS noise "
+                    "inflation); the requested scaling is being ignored. "
+                    "Use smoothing='kalman' for ABS-robust processing.",
+                )
+            result = kf.run(
+                longitude=lon_interp,
+                latitude=lat_interp,
+                v_reference_ms=v_reference_ms,
+                yaw_rate_rad=yaw_rate_rad,
+                gps_update_mask=gps_update_mask,
+            )
+        else:
+            result = kf.run(
+                longitude=lon_interp,
+                latitude=lat_interp,
+                v_reference_ms=v_reference_ms,
+                yaw_rate_rad=yaw_rate_rad,
+                gps_update_mask=gps_update_mask,
+                speed_noise_scale=speed_noise_scale,
+                yaw_rate_noise_scale=yaw_rate_noise_scale,
+                process_noise_scale=process_noise_scale,
+            )
 
         return result.longitude, result.latitude, result.speed_ms
